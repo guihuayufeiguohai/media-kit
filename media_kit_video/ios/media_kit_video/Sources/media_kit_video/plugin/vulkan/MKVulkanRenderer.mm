@@ -29,6 +29,14 @@ constexpr VkImageUsageFlags kUsage =
     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
+// VK_KHR_portability_subset's name macro is declared in vulkan_beta.h, which
+// vulkan.h only includes when VK_ENABLE_BETA_EXTENSIONS is defined (the
+// extension is still marked provisional in the Vulkan registry). Every
+// MoltenVK VkDevice requires it, but pulling in the whole beta header for one
+// string is not worth the extra surface -- spell it out. The loader compares
+// extension names by content, so a literal is equivalent to the macro.
+constexpr const char *kPortabilitySubsetExt = "VK_KHR_portability_subset";
+
 struct Slot {
   CVPixelBufferRef pb = nullptr;
   VkImage image = VK_NULL_HANDLE;
@@ -208,8 +216,8 @@ void SetError(NSString **out, NSString *message) {
   feats.pNext = &f12;
 
   std::vector<const char *> exts;
-  if (HasDeviceExtension(_pd, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
-    exts.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+  if (HasDeviceExtension(_pd, kPortabilitySubsetExt)) {
+    exts.push_back(kPortabilitySubsetExt);
   }
   if (!HasDeviceExtension(_pd, VK_EXT_METAL_OBJECTS_EXTENSION_NAME)) {
     // Without it the IOSurface cannot back the VkImage, i.e. no zero-copy.
@@ -264,7 +272,7 @@ void SetError(NSString **out, NSString *message) {
   init.device = _dev;
   // Must match what was enabled above; mpv forwards this list to FFmpeg.
   static const char *kExtensions[] = {
-      VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+      kPortabilitySubsetExt,
       VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
   };
   init.extensions = kExtensions;
