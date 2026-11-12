@@ -57,11 +57,30 @@ ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h: .cache/headers/bundle.tar.gz
 	# common parent must be on the include path -- that is exactly what
 	# Headers/ becomes inside media_kit_video.framework.
 	${TAR} -xvf .cache/headers/bundle.tar.gz -C .cache/headers/extract ./include/mpv ./include/vulkan ./include/vk_video
+	# Wipe the destination first: an earlier run may have copied the full
+	# Vulkan tree in, and leftover platform headers would still be picked up
+	# by source_files and pulled into the umbrella.
+	rm -rf ${HEADERS_DESTDIR_ESCAPED}/vulkan ${HEADERS_DESTDIR_ESCAPED}/vk_video
 	mkdir -p ${HEADERS_DESTDIR_ESCAPED}/mpv ${HEADERS_DESTDIR_ESCAPED}/vulkan ${HEADERS_DESTDIR_ESCAPED}/vk_video
 	cp .cache/headers/extract/include/mpv/*.h ${HEADERS_DESTDIR_ESCAPED}/mpv/
-	# *.h only: the .hpp files (vulkan.hpp, vulkan_structs.hpp, ...) are C++17
-	# only and would be picked up by the generated umbrella header otherwise.
-	cp .cache/headers/extract/include/vulkan/*.h ${HEADERS_DESTDIR_ESCAPED}/vulkan/
+	# Only the headers iOS can actually compile. CocoaPods generates an
+	# umbrella header that imports every public header directly, bypassing
+	# the `#ifdef VK_USE_PLATFORM_*` guards in vulkan.h -- so copying the
+	# whole tree made the umbrella pull in vulkan_fuchsia.h (zx_handle_t),
+	# vulkan_win32.h (HWND/HINSTANCE) and vulkan_ggp.h (GgpStreamDescriptor),
+	# none of which exist on iOS.
+	#
+	# vulkan.h only includes vk_platform.h and vulkan_core.h unconditionally;
+	# every other include is guarded, and the only guard we define is
+	# VK_USE_PLATFORM_METAL_EXT (see the podspec), so vulkan_metal.h is the
+	# one platform header needed. It is self-contained: it typedefs
+	# IOSurfaceRef itself and falls back to `void*` for the MTL handles.
+	cp .cache/headers/extract/include/vulkan/vulkan.h \
+	   .cache/headers/extract/include/vulkan/vulkan_core.h \
+	   .cache/headers/extract/include/vulkan/vk_platform.h \
+	   .cache/headers/extract/include/vulkan/vulkan_metal.h \
+	   .cache/headers/extract/include/vulkan/vulkan_ios.h \
+	   ${HEADERS_DESTDIR_ESCAPED}/vulkan/
 	cp .cache/headers/extract/include/vk_video/*.h ${HEADERS_DESTDIR_ESCAPED}/vk_video/
 	# Fail loudly: a silent 0.36-style header set, or a missing Vulkan tree,
 	# would only surface as a module-build error deep inside the host app.
