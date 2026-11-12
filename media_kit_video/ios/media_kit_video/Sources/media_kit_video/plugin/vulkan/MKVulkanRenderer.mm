@@ -73,6 +73,15 @@ void SetError(NSString **out, NSString *message) {
 
 }  // namespace
 
+// mpv's update callback. Fires on mpv's own thread whenever a new frame can be
+// rendered; media_kit's VideoOutput uses it to drive resize + render +
+// textureFrameAvailable. TextureHW wires the same thing in its initMPV().
+static void OnMpvRenderUpdate(void *ctx) {
+  MKVulkanRenderer *self = (__bridge MKVulkanRenderer *)ctx;
+  void (^cb)(void) = self.onUpdate;
+  if (cb) cb();
+}
+
 @implementation MKVulkanRenderer {
   mpv_handle *_mpv;
   mpv_render_context *_rc;
@@ -101,6 +110,7 @@ void SetError(NSString **out, NSString *message) {
   int _width;
   int _height;
   bool _deviceLost;
+  bool _loggedFirstFrame;
   NSString *_backend;
 
   std::mutex _mutex;
@@ -347,6 +357,10 @@ void SetError(NSString **out, NSString *message) {
       vkGetPhysicalDeviceProperties(_pd, &props);
       _backend = [NSString
           stringWithFormat:@"vulkan (%@) on %s", name, props.deviceName];
+      // Without this the render loop never runs: nothing else ever calls
+      // render()/resize(), so the slots stay empty and Flutter shows nothing.
+      mpv_render_context_set_update_callback(_rc, OnMpvRenderUpdate,
+                                             (__bridge void *)self);
       return YES;
     }
     _rc = nullptr;
@@ -501,6 +515,8 @@ void SetError(NSString **out, NSString *message) {
   NSString *error = nil;
   if (![self rebuildSlots:width height:height error:&error]) {
     NSLog(@"TextureVK: resize %dx%d failed: %@", width, height, error);
+  } else {
+    NSLog(@"TextureVK: resize %dx%d, %zu slots", width, height, _slots.size());
   }
 }
 
@@ -562,6 +578,10 @@ void SetError(NSString **out, NSString *message) {
   _readySlot = slotIndex;
   _writeSlot = (slotIndex + 1) % (int)_slots.size();
   mpv_render_context_report_swap(_rc);
+  if (!_loggedFirstFrame) {
+    _loggedFirstFrame = true;
+    NSLog(@"TextureVK: first frame %dx%d", slot.width, slot.height);
+  }
   return YES;
 }
 

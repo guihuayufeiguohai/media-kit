@@ -51,6 +51,15 @@ public class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     super.init()
 
+    // mpv calls this from its own thread. Hop to main like TextureHW does, so
+    // VideoOutput.updateCallback() sees exactly the same threading as the
+    // OpenGL path. `weak self` breaks the renderer -> block -> self cycle.
+    renderer.onUpdate = { [weak self] in
+      DispatchQueue.main.async {
+        self?.updateCallback()
+      }
+    }
+
     NSLog("TextureVK: \(renderer.backendDescription)")
   }
 

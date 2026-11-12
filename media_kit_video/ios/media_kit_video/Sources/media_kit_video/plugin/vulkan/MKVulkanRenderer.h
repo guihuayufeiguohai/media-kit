@@ -30,6 +30,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// e.g. "vulkan (gpu-next) on Apple M1" or "vulkan (unknown renderer)".
 @property(nonatomic, readonly, copy) NSString *backendDescription;
 
+/// Invoked on mpv's update thread whenever a new frame is ready to be
+/// rendered. Without this the render loop never starts: media_kit drives
+/// everything (resize + render + textureFrameAvailable) from this callback,
+/// exactly like TextureHW does through
+/// mpv_render_context_set_update_callback.
+@property(nonatomic, copy, nullable) void (^onUpdate)(void);
+
 /// Recreates the image ring. Cheap when the size is unchanged.
 - (void)resizeWidth:(int)width height:(int)height;
 
