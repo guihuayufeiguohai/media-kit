@@ -51,15 +51,28 @@ TAR=tar
 ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h: .cache/headers/bundle.tar.gz
 	rm -rf .cache/headers/extract
 	mkdir -p .cache/headers/extract
-	${TAR} -xvf .cache/headers/bundle.tar.gz -C .cache/headers/extract ./include/mpv
-	mkdir -p ${HEADERS_DESTDIR_ESCAPED}/mpv
+	# mpv/ for the API, vulkan/ + vk_video/ because render_vk.h includes
+	# <vulkan/vulkan.h>. vulkan_core.h then includes "vk_video/..." by a
+	# RELATIVE path, so vk_video must stay a sibling of vulkan/ and their
+	# common parent must be on the include path -- that is exactly what
+	# Headers/ becomes inside media_kit_video.framework.
+	${TAR} -xvf .cache/headers/bundle.tar.gz -C .cache/headers/extract ./include/mpv ./include/vulkan ./include/vk_video
+	mkdir -p ${HEADERS_DESTDIR_ESCAPED}/mpv ${HEADERS_DESTDIR_ESCAPED}/vulkan ${HEADERS_DESTDIR_ESCAPED}/vk_video
 	cp .cache/headers/extract/include/mpv/*.h ${HEADERS_DESTDIR_ESCAPED}/mpv/
-	# Fail loudly: the Vulkan renderer needs these, and a silent 0.36-style
-	# header set would only surface as a compile error deep in ObjC++.
+	# *.h only: the .hpp files (vulkan.hpp, vulkan_structs.hpp, ...) are C++17
+	# only and would be picked up by the generated umbrella header otherwise.
+	cp .cache/headers/extract/include/vulkan/*.h ${HEADERS_DESTDIR_ESCAPED}/vulkan/
+	cp .cache/headers/extract/include/vk_video/*.h ${HEADERS_DESTDIR_ESCAPED}/vk_video/
+	# Fail loudly: a silent 0.36-style header set, or a missing Vulkan tree,
+	# would only surface as a module-build error deep inside the host app.
 	test -f ${HEADERS_DESTDIR_ESCAPED}/mpv/render_vk.h
 	test -f ${HEADERS_DESTDIR_ESCAPED}/mpv/client.h
+	test -f ${HEADERS_DESTDIR_ESCAPED}/vulkan/vulkan_core.h
+	test -f ${HEADERS_DESTDIR_ESCAPED}/vulkan/vulkan_metal.h
+	test -f ${HEADERS_DESTDIR_ESCAPED}/vk_video/vulkan_video_codecs_common.h
 	touch ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h
 
 .PHONY: clean
 clean:
 	rm -rf .cache
+	rm -rf ${HEADERS_DESTDIR_ESCAPED}/mpv ${HEADERS_DESTDIR_ESCAPED}/vulkan ${HEADERS_DESTDIR_ESCAPED}/vk_video
