@@ -21,8 +21,14 @@ MPV_BUNDLE_PATH=guihuayufeiguohai/libmpv-darwin-build-upgrade/releases/download/
 # github.com:443 is unreachable on some networks (mainland China in
 # particular), which makes a plain `curl https://github.com/...` hang until it
 # times out. Try these mirrors first, then fall back to github.com directly.
-# Override with `make MPV_BUNDLE_PROXIES=https://ghfast.top/` if one is down.
-MPV_BUNDLE_PROXIES ?= https://gh-proxy.org/ https://ghfast.top/ https://ghproxy.net/
+#
+# Order is by measured throughput on a 23.7 MB asset:
+#   gh-proxy.com    ~390 KB/s   (also proxies `git clone`, unlike .org)
+#   ghproxy.net     ~200 KB/s
+#   gh-proxy.org    ~95 KB/s    (works, just slow)
+# ghfast.top / gh.llkk.cc / github.moeyy.xyz were unreachable when measured.
+# Override with `make MPV_BUNDLE_PROXIES=https://ghproxy.net/` if one is down.
+MPV_BUNDLE_PROXIES ?= https://gh-proxy.com/ https://ghproxy.net/ https://gh-proxy.org/
 
 TAR=tar
 
