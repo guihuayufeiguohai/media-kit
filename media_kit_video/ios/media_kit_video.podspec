@@ -42,6 +42,19 @@ Pod::Spec.new do |s|
     # mpv_vulkan_init_params and VkImportMetalIOSurfaceInfoEXT cannot be
     # expressed in Swift.
     s.source_files        = 'media_kit_video/Sources/media_kit_video/plugin/**/*.{swift,h,mm}', 'Headers/**/*.h'
+    # render_vk.h does `#include <vulkan/vulkan.h>` with an explicit
+    # subdirectory. CocoaPods FLATTENS public headers into
+    # media_kit_video.framework/Headers (the generated umbrella reads
+    # `#import "render_vk.h"`, `#import "client.h"`, ...), so the `vulkan/`
+    # level disappears and that include can never resolve in any target that
+    # builds the module -- which the host app does, via
+    # GeneratedPluginRegistrant.m doing `@import media_kit_video`.
+    #
+    # Nothing outside this pod needs the Vulkan render API: it is used only by
+    # MKVulkanRenderer.mm, which finds it through $(PODS_TARGET_SRCROOT)/Headers
+    # where vulkan/ and vk_video/ still exist as real siblings. Keep it out of
+    # the umbrella.
+    s.private_header_files = 'Headers/mpv/render_vk.h'
     # Metal + CoreVideo + IOSurface back the zero-copy IOSurface path;
     # QuartzCore is needed for CAMetalLayer/CATransaction-free presentation.
     s.frameworks          = 'Metal', 'CoreVideo', 'IOSurface', 'QuartzCore'
