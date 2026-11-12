@@ -520,6 +520,32 @@ static void OnMpvRenderUpdate(void *ctx) {
   }
 }
 
+// One-shot dump of what mpv decided to do with the source colours. This is
+// the only way to tell "DV tone mapping happened" from "it just looks okay":
+// an 8-bit BGRA target cannot carry PQ, so video-out-params must show a
+// tone-mapped SDR result, not pq/bt.2020 passed through.
+- (void)logColorPipeline {
+  static const char *keys[] = {
+      "video-params/primaries",
+      "video-params/gamma",
+      "video-params/sig-peak",
+      "video-params/pixelformat",
+      "video-params/colormatrix",
+      "video-out-params/primaries",
+      "video-out-params/gamma",
+      "video-out-params/sig-peak",
+      "video-out-params/pixelformat",
+      "tone-mapping",
+      "hdr-compute-peak",
+      "target-peak",
+  };
+  for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+    char *v = mpv_get_property_string(_mpv, keys[i]);
+    NSLog(@"TextureVK: %s = %s", keys[i], v ? v : "(unset)");
+    if (v) mpv_free(v);
+  }
+}
+
 - (BOOL)render {
   std::lock_guard<std::mutex> lock(_mutex);
   if (!_rc || _slots.empty() || _deviceLost) return NO;
@@ -581,6 +607,7 @@ static void OnMpvRenderUpdate(void *ctx) {
   if (!_loggedFirstFrame) {
     _loggedFirstFrame = true;
     NSLog(@"TextureVK: first frame %dx%d", slot.width, slot.height);
+    [self logColorPipeline];
   }
   return YES;
 }
