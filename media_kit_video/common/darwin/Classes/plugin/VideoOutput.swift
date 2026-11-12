@@ -93,13 +93,12 @@ public class VideoOutput: NSObject {
     if enableHardwareAcceleration {
       // Vulkan first: gpu-next is the only renderer that handles Dolby Vision
       // (IPT-PQ-C2) correctly. TextureVK returns nil when MoltenVK or mpv's
-      // Vulkan render API is unavailable, and we then keep the OpenGL path
-      // that media_kit has always used.
+      // Vulkan render API is unavailable.
       //
       // The #if has to wrap the whole block: TextureVK only exists in the iOS
       // target, so merely naming the type outside the guard would break the
       // macOS build.
-      var createdVulkanTexture = false
+      var createdTexture = false
       #if os(iOS)
         if let vulkanTexture = TextureVK(
           handle: handle,
@@ -112,11 +111,34 @@ public class VideoOutput: NSObject {
           }
         ) {
           texture = SafeResizableTexture(vulkanTexture)
-          createdVulkanTexture = true
+          createdTexture = true
+        }
+
+        if !createdTexture {
+          // Do NOT fall back to TextureHW here. This libmpv is built with
+          // -Dgl=disabled, so mpv_render_context_create(OPENGL) always fails;
+          // TextureHW then keeps a nil render context and the first
+          // mpv_render_context_render() dereferences it -- that is the crash
+          // seen when opening the player. Software is the only renderer this
+          // build still contains.
+          NSLog("VideoOutput: Vulkan unavailable, falling back to software")
+          texture = SafeResizableTexture(
+            TextureSW(
+              handle: handle,
+              // Use `weak self` to prevent memory leaks
+              updateCallback: { [weak self]() in
+                guard let that = self else {
+                  return
+                }
+                that.updateCallback()
+              }
+            )
+          )
+          createdTexture = true
         }
       #endif
 
-      if !createdVulkanTexture {
+      if !createdTexture {
         texture = SafeResizableTexture(
           TextureHW(
             handle: handle,

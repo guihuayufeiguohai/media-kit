@@ -82,6 +82,14 @@ void SetError(NSString **out, NSString *message) {
   VkDevice _dev;
   VkQueue _queue;
   uint32_t _qf;
+  // The VkPhysicalDeviceFeatures2 chain the device was created with. It must
+  // outlive mpv_render_context_create() and mpv_render_context_free(), because
+  // mpv_vulkan_init_params.features points at it and libplacebo reads it
+  // during pl_vulkan_import(). Keeping it in ivars (instead of a local in
+  // -createDevice:) is what makes that safe.
+  VkPhysicalDeviceFeatures2 _features;
+  VkPhysicalDeviceVulkan12Features _features12;
+  VkPhysicalDeviceVulkan13Features _features13;
   // One timeline semaphore shared by all slots: every render signals value
   // _timelineValue, and we wait for it before handing the frame to Flutter.
   VkSemaphore _timeline;
@@ -202,18 +210,48 @@ void SetError(NSString **out, NSString *message) {
 }
 
 - (BOOL)createDevice:(NSString **)error {
-  // libplacebo needs timeline semaphores and benefits from synchronization2.
-  VkPhysicalDeviceVulkan13Features f13 = {};
-  f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-  f13.synchronization2 = VK_TRUE;
-  VkPhysicalDeviceVulkan12Features f12 = {};
-  f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-  f12.pNext = &f13;
-  f12.timelineSemaphore = VK_TRUE;
-  f12.hostQueryReset = VK_TRUE;
-  VkPhysicalDeviceFeatures2 feats = {};
-  feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-  feats.pNext = &f12;
+  // libplacebo's pl_vulkan_import() refuses a device unless the
+  // VkPhysicalDeviceVulkan12Features it is handed has BOTH hostQueryReset and
+  // timelineSemaphore set (check_required_features() in libplacebo's
+  // src/vulkan/context.c). It reads them from
+  // mpv_vulkan_init_params.features, NOT from the device itself -- passing
+  // nullptr there is exactly why mpv_render_context_create() used to answer
+  // "not supported" (MPV_ERROR_UNSUPPORTED) after MoltenVK had already
+  // created a perfectly good VkDevice.
+  //
+  // Query what the GPU advertises first, so an unsupported device produces a
+  // readable error instead of a vkCreateDevice failure.
+  VkPhysicalDeviceVulkan13Features supported13 = {};
+  supported13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+  VkPhysicalDeviceVulkan12Features supported12 = {};
+  supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  supported12.pNext = &supported13;
+  VkPhysicalDeviceFeatures2 supported = {};
+  supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  supported.pNext = &supported12;
+  vkGetPhysicalDeviceFeatures2(_pd, &supported);
+
+  if (!supported12.timelineSemaphore || !supported12.hostQueryReset) {
+    SetError(error, @"GPU lacks timelineSemaphore/hostQueryReset");
+    return NO;
+  }
+
+  // Same chain, stored in ivars so it outlives every mpv call that reads it.
+  _features13 = (VkPhysicalDeviceVulkan13Features){};
+  _features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+  _features13.synchronization2 = supported13.synchronization2;
+
+  _features12 = (VkPhysicalDeviceVulkan12Features){};
+  _features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  _features12.pNext = &_features13;
+  _features12.timelineSemaphore = VK_TRUE;
+  _features12.hostQueryReset = VK_TRUE;
+  _features12.bufferDeviceAddress = supported12.bufferDeviceAddress;
+  _features12.vulkanMemoryModel = supported12.vulkanMemoryModel;
+
+  _features = (VkPhysicalDeviceFeatures2){};
+  _features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  _features.pNext = &_features12;
 
   std::vector<const char *> exts;
   if (HasDeviceExtension(_pd, kPortabilitySubsetExt)) {
@@ -235,7 +273,7 @@ void SetError(NSString **out, NSString *message) {
 
   VkDeviceCreateInfo dci = {};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  dci.pNext = &feats;
+  dci.pNext = &_features;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   dci.enabledExtensionCount = (uint32_t)exts.size();
@@ -277,7 +315,10 @@ void SetError(NSString **out, NSString *message) {
   };
   init.extensions = kExtensions;
   init.num_extensions = 2;
-  init.features = nullptr;
+  // MUST be the same chain the device was created with: libplacebo reads
+  // hostQueryReset/timelineSemaphore from here and refuses the import
+  // otherwise. nullptr here was the whole reason Vulkan "wasn't supported".
+  init.features = &_features;
   init.queue_graphics = {_qf, 1};
   init.queue_compute = {_qf, 1};
   init.queue_transfer = {_qf, 1};
