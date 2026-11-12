@@ -11,17 +11,14 @@ MPV_BUNDLE_VERSION=v0.1.0-vulkan.1
 MPV_BUNDLE_SHA256SUM=06c9b1007619c422207728f88fc516d82e626b297e5737d2245f756dbb215d16
 MPV_BUNDLE_PATH=guihuayufeiguohai/libmpv-darwin-build-upgrade/releases/download/${MPV_BUNDLE_VERSION}/vulkan-bundle-ios-arm64.tar.gz
 
-# github.com:443 is unreachable on some networks (mainland China in
-# particular), which makes a plain `curl https://github.com/...` hang until it
-# times out. Try these mirrors first, then fall back to github.com directly.
-#
-# Order is by measured throughput on the 23.7 MB bundle:
-#   gh-proxy.com    ~390 KB/s   (also proxies `git clone`, unlike .org)
-#   ghproxy.net     ~200 KB/s
-#   gh-proxy.org    ~95 KB/s    (works, just slow)
-# ghfast.top / gh.llkk.cc / github.moeyy.xyz were unreachable when measured.
-# Override with `make MPV_BUNDLE_PROXIES=https://ghproxy.net/` if one is down.
-MPV_BUNDLE_PROXIES ?= https://gh-proxy.com/ https://ghproxy.net/ https://gh-proxy.org/
+# Direct github.com comes FIRST on purpose. Release assets are served by
+# objects.githubusercontent.com, which stays reachable on networks where the
+# github.com git endpoint is not; measured 4-10 MB/s direct versus ~390 KB/s
+# through the best mirror. The mirrors below are only a fallback for networks
+# that block the release CDN as well. Override with
+#   make MPV_BUNDLE_MIRRORS="https://gh-proxy.com/"      (single mirror)
+#   make MPV_BUNDLE_MIRRORS=                             (direct only)
+MPV_BUNDLE_MIRRORS ?= https://gh-proxy.com/ https://ghproxy.net/ https://gh-proxy.org/
 
 TAR=tar
 TAR_WILDCARDS_FLAG := $(shell ${TAR} --version 2>&1 | grep -q 'GNU' && echo "--wildcards" || echo "")
@@ -33,14 +30,17 @@ SED_INPLACE_FLAG := $(shell ${SED} --version 2>&1 | grep -q 'GNU' && echo "" || 
 	mkdir -p .cache
 	rm -f .cache/*.tmp .cache/bundle.tar.gz
 	@set -e; \
-	for p in $(MPV_BUNDLE_PROXIES); do \
-		echo "==> xcframework: fetching via $$p"; \
-		if curl -fL --retry 2 --retry-delay 1 --connect-timeout 15 -o .cache/bundle.tar.gz.tmp "$$phttps://github.com/${MPV_BUNDLE_PATH}"; then \
-			echo "==> xcframework: ok via $$p"; exit 0; \
+	origin="https://github.com/${MPV_BUNDLE_PATH}"; \
+	urls="$$origin"; \
+	for m in $(MPV_BUNDLE_MIRRORS); do urls="$$urls $${m}$$origin"; done; \
+	for u in $$urls; do \
+		echo "==> bundle: trying $$u"; \
+		if curl -fL --retry 2 --retry-delay 1 --connect-timeout 20 -o .cache/bundle.tar.gz.tmp "$$u"; then \
+			echo "==> bundle: ok"; exit 0; \
 		fi; \
 	done; \
-	echo "==> xcframework: all mirrors failed, trying github.com directly"; \
-	curl -fL --retry 2 --retry-delay 1 --connect-timeout 15 -o .cache/bundle.tar.gz.tmp "https://github.com/${MPV_BUNDLE_PATH}"
+	echo "==> bundle: every source failed; retry with MPV_BUNDLE_MIRRORS=<prefix>"; \
+	exit 1
 	echo "${MPV_BUNDLE_SHA256SUM}  .cache/bundle.tar.gz.tmp" | shasum -a 256 -c -
 	mv .cache/bundle.tar.gz.tmp .cache/bundle.tar.gz
 	touch .cache/bundle.tar.gz
