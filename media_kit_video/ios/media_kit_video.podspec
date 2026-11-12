@@ -54,7 +54,17 @@ Pod::Spec.new do |s|
     # MKVulkanRenderer.mm, which finds it through $(PODS_TARGET_SRCROOT)/Headers
     # where vulkan/ and vk_video/ still exist as real siblings. Keep it out of
     # the umbrella.
-    s.private_header_files = 'Headers/mpv/render_vk.h'
+    #
+    # The vulkan/ and vk_video/ trees have to be private for the same reason:
+    # vulkan_core.h does `#include "vk_video/vulkan_video_codec_h264std.h"`,
+    # which only resolves because vk_video/ is a sibling of vulkan/ and their
+    # parent is on the include path. Flattened into the framework, that
+    # relative include breaks exactly like <vulkan/vulkan.h> did.
+    s.private_header_files = [
+      'Headers/mpv/render_vk.h',
+      'Headers/vulkan/**/*.h',
+      'Headers/vk_video/**/*.h',
+    ]
     # Metal + CoreVideo + IOSurface back the zero-copy IOSurface path;
     # QuartzCore is needed for CAMetalLayer/CATransaction-free presentation.
     s.frameworks          = 'Metal', 'CoreVideo', 'IOSurface', 'QuartzCore'
