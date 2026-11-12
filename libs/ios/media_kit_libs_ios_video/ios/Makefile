@@ -52,6 +52,16 @@ Frameworks/*.xcframework: .cache/bundle.tar.gz
 	mkdir -p .cache/extract
 	${TAR} -xvf .cache/bundle.tar.gz -C .cache/extract ./xcframework
 	cp -R .cache/extract/xcframework/*.xcframework Frameworks/
+	# The published bundle stores every framework directory as 0555, and both
+	# `cp -R` and CocoaPods' `rsync -a` preserve that. The result was 94
+	# read-only directories inside Runner.app/Frameworks, which made
+	#   flutter clean            -> "failed to delete a directory at build"
+	#   xcodebuild archive       -> "Runner couldn't be removed because you
+	#                               don't have permission to access it"
+	# and silently skipped code signing for the vendored frameworks, so the
+	# device rejected the app with "No code signature found" (0xe800801c).
+	# Make the tree writable as soon as it is unpacked.
+	chmod -R u+w Frameworks/*.xcframework
 	# Mpv is the one media_kit_video links against; Uchardet/Avcodec/... are
 	# its runtime dependencies. A missing Mpv means the bundle layout changed.
 	test -d Frameworks/Mpv.xcframework
