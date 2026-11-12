@@ -2,10 +2,19 @@
 
 #include <mpv/client.h>
 #include <mpv/render_vk.h>
+
+// VkImportMetalIOSurfaceInfoEXT and VK_EXT_METAL_OBJECTS_EXTENSION_NAME live in
+// vulkan_metal.h, which vulkan.h only includes when this macro is defined.
+// The podspec sets it as well; the guard here means the file still compiles if
+// someone builds it outside CocoaPods.
+#ifndef VK_USE_PLATFORM_METAL_EXT
+#define VK_USE_PLATFORM_METAL_EXT 1
+#endif
 #include <vulkan/vulkan.h>
 
 #import <Metal/Metal.h>
 
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -168,6 +177,9 @@ void SetError(NSString **out, NSString *message) {
   vkGetPhysicalDeviceQueueFamilyProperties(_pd, &nqf, nullptr);
   std::vector<VkQueueFamilyProperties> qf(nqf);
   vkGetPhysicalDeviceQueueFamilyProperties(_pd, &nqf, qf.data());
+  // Sentinel first: _qf is a bare ivar, so without this the "no graphics
+  // queue" check below would compare against whatever the memory held.
+  _qf = UINT32_MAX;
   for (uint32_t i = 0; i < nqf; i++) {
     if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
       _qf = i;

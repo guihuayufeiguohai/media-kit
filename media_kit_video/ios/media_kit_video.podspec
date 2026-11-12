@@ -54,6 +54,15 @@ Pod::Spec.new do |s|
       'GCC_PREPROCESSOR_DEFINITIONS'                 => '"$(inherited)" GL_SILENCE_DEPRECATION COREVIDEO_SILENCE_GL_DEPRECATION VK_USE_PLATFORM_METAL_EXT=1',
       'FRAMEWORK_SEARCH_PATHS[sdk=iphoneos*]'        => sprintf('"$(inherited)" "%s"', framework_search_paths_iphoneos),
       'FRAMEWORK_SEARCH_PATHS[sdk=iphonesimulator*]' => sprintf('"$(inherited)" "%s"', framework_search_paths_iphonesimulator),
+      # render_vk.h does `#include <vulkan/vulkan.h>` with angle brackets, and
+      # clang does NOT consult FRAMEWORK_SEARCH_PATHS for that form: it would
+      # look for `vulkan.framework/Headers/vulkan.h`, which does not exist.
+      # The bundle ships the headers under Mpv.framework/Headers/vulkan/, so
+      # that directory has to be an -I path. The pod's own Headers dir is
+      # listed as well so <mpv/render_vk.h> resolves without depending on
+      # CocoaPods' public-header layout.
+      'HEADER_SEARCH_PATHS[sdk=iphoneos*]'        => sprintf('"$(inherited)" "$(PODS_TARGET_SRCROOT)/Headers" "%s/Mpv.framework/Headers"', framework_search_paths_iphoneos),
+      'HEADER_SEARCH_PATHS[sdk=iphonesimulator*]' => sprintf('"$(inherited)" "$(PODS_TARGET_SRCROOT)/Headers" "%s/Mpv.framework/Headers"', framework_search_paths_iphonesimulator),
       'OTHER_LDFLAGS'                                => '"$(inherited)" -framework Mpv',
       # Flutter.framework does not contain a i386 slice.
       'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',

@@ -93,11 +93,15 @@ public class VideoOutput: NSObject {
     if enableHardwareAcceleration {
       // Vulkan first: gpu-next is the only renderer that handles Dolby Vision
       // (IPT-PQ-C2) correctly. TextureVK returns nil when MoltenVK or mpv's
-      // Vulkan render API is unavailable, and we keep the OpenGL path that
-      // media_kit has always used.
-      var vulkanTexture: TextureVK?
+      // Vulkan render API is unavailable, and we then keep the OpenGL path
+      // that media_kit has always used.
+      //
+      // The #if has to wrap the whole block: TextureVK only exists in the iOS
+      // target, so merely naming the type outside the guard would break the
+      // macOS build.
+      var createdVulkanTexture = false
       #if os(iOS)
-        vulkanTexture = TextureVK(
+        if let vulkanTexture = TextureVK(
           handle: handle,
           // Use `weak self` to prevent memory leaks
           updateCallback: { [weak self]() in
@@ -106,12 +110,13 @@ public class VideoOutput: NSObject {
             }
             that.updateCallback()
           }
-        )
+        ) {
+          texture = SafeResizableTexture(vulkanTexture)
+          createdVulkanTexture = true
+        }
       #endif
 
-      if let vulkanTexture = vulkanTexture {
-        texture = SafeResizableTexture(vulkanTexture)
-      } else {
+      if !createdVulkanTexture {
         texture = SafeResizableTexture(
           TextureHW(
             handle: handle,
