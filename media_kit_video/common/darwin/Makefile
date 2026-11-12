@@ -16,15 +16,29 @@ all: ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h
 # Bundle layout: ./include/mpv/{client,render,render_gl,render_vk,stream_cb}.h
 MPV_BUNDLE_VERSION=v0.1.0-vulkan.1
 MPV_BUNDLE_SHA256SUM=06c9b1007619c422207728f88fc516d82e626b297e5737d2245f756dbb215d16
-MPV_BUNDLE_URL=https://github.com/guihuayufeiguohai/libmpv-darwin-build-upgrade/releases/download/${MPV_BUNDLE_VERSION}/vulkan-bundle-ios-arm64.tar.gz
+MPV_BUNDLE_PATH=guihuayufeiguohai/libmpv-darwin-build-upgrade/releases/download/${MPV_BUNDLE_VERSION}/vulkan-bundle-ios-arm64.tar.gz
+
+# github.com:443 is unreachable on some networks (mainland China in
+# particular), which makes a plain `curl https://github.com/...` hang until it
+# times out. Try these mirrors first, then fall back to github.com directly.
+# Override with `make MPV_BUNDLE_PROXIES=https://ghfast.top/` if one is down.
+MPV_BUNDLE_PROXIES ?= https://gh-proxy.org/ https://ghfast.top/ https://ghproxy.net/
 
 TAR=tar
 
 .cache/headers/bundle.tar.gz:
 	mkdir -p .cache/headers
 	rm -f .cache/headers/*.tmp .cache/headers/bundle.tar.gz
-	curl -L '${MPV_BUNDLE_URL}' -o .cache/headers/bundle.tar.gz.tmp
-	shasum -a 256 -c <<< '${MPV_BUNDLE_SHA256SUM}  .cache/headers/bundle.tar.gz.tmp'
+	@set -e; \
+	for p in $(MPV_BUNDLE_PROXIES); do \
+		echo "==> headers: fetching via $$p"; \
+		if curl -fL --retry 2 --retry-delay 1 --connect-timeout 15 -o .cache/headers/bundle.tar.gz.tmp "$$phttps://github.com/${MPV_BUNDLE_PATH}"; then \
+			echo "==> headers: ok via $$p"; exit 0; \
+		fi; \
+	done; \
+	echo "==> headers: all mirrors failed, trying github.com directly"; \
+	curl -fL --retry 2 --retry-delay 1 --connect-timeout 15 -o .cache/headers/bundle.tar.gz.tmp "https://github.com/${MPV_BUNDLE_PATH}"
+	echo "${MPV_BUNDLE_SHA256SUM}  .cache/headers/bundle.tar.gz.tmp" | shasum -a 256 -c -
 	mv .cache/headers/bundle.tar.gz.tmp .cache/headers/bundle.tar.gz
 	touch .cache/headers/bundle.tar.gz
 
