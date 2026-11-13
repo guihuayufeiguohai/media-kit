@@ -2501,6 +2501,14 @@ class NativePlayer extends PlatformPlayer {
           'target-contrast': '1000',
           'tone-mapping': 'bt.2390',
           'tone-mapping-mode': 'rgb',
+          // The compositor's CAMetalLayer is kCGColorSpaceExtendedSRGB (probed
+          // on an A15: colorspace "sRGB IEC61966-2.1; extended range",
+          // pixelFormat 552 = MTLPixelFormatBGR10_XR). Leaving these on "auto"
+          // lets libplacebo pick bt.1886, i.e. gamma 2.4, for an sRGB surface
+          // -- every midtone lands too low, which reads as "dim and washed
+          // out" at the same time. Pin both to what the surface actually is.
+          'target-prim': 'bt.709',
+          'target-trc': 'srgb',
           'dither': 'fruit',
         } else ...{
           'dither': 'no',
