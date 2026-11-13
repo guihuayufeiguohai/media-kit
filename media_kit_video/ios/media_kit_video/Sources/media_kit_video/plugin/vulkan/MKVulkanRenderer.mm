@@ -24,8 +24,20 @@
 namespace {
 
 constexpr int kRingSize = 3;
-// Matches kCVPixelFormatType_32BGRA, what Flutter's Metal compositor expects.
-constexpr VkFormat kFormat = VK_FORMAT_B8G8R8A8_UNORM;
+// Flutter's CAMetalLayer is MTLPixelFormatBGR10_XR (10 bits per channel,
+// extended range), so an 8-bit BGRA intermediate throws away three quarters of
+// the precision the compositor can actually display. That is exactly why the
+// HDR tone-mapping test pattern collapses its top half into white no matter
+// which target-peak is used: 21 patches spread over 256 levels leaves ~1.5
+// levels per patch in the highlights.
+//
+// kCVPixelFormatType_ARGB2101010LEPacked is the CVPixelBuffer flavour of the
+// same packed 32-bit layout. CVMetalTextureCache maps it to
+// MTLPixelFormatBGR10A2Unorm, which MoltenVK exposes as
+// VK_FORMAT_A2B10G10R10_UNORM_PACK32 (R in the low 10 bits, matching the
+// little-endian memory layout of the CoreVideo format).
+constexpr VkFormat kFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+constexpr OSType kPixelFormat = kCVPixelFormatType_ARGB2101010LEPacked;
 constexpr VkImageUsageFlags kUsage =
     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -402,7 +414,7 @@ static void OnMpvRenderUpdate(void *ctx) {
   };
   CVPixelBufferRef pb = nullptr;
   if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height,
-                          kCVPixelFormatType_32BGRA,
+                          kPixelFormat,
                           (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
     SetError(error, @"CVPixelBufferCreate failed");
     return NO;
