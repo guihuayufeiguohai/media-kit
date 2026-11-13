@@ -541,8 +541,13 @@ static void OnMpvRenderUpdate(void *ctx) {
       "video-out-params/sig-peak",
       "video-out-params/pixelformat",
       "tone-mapping",
+      "tone-mapping-mode",
       "hdr-compute-peak",
       "target-peak",
+      "target-contrast",
+      "target-prim",
+      "target-trc",
+      "dither",
   };
   for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     char *v = mpv_get_property_string(_mpv, keys[i]);
