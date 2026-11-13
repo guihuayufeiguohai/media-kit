@@ -2509,6 +2509,14 @@ class NativePlayer extends PlatformPlayer {
           // out" at the same time. Pin both to what the surface actually is.
           'target-prim': 'bt.709',
           'target-trc': 'srgb',
+          // RealVideo decodes into mpv's DR (direct rendering) pool, which
+          // asks the VO for an image before the VO has produced a frame.
+          // Under the libmpv render API that request can block forever: the
+          // .rmvb test logged "Allocating new (host-cached) DR image..." and
+          // then the main thread sat in __psynch_cvwait until the watchdog
+          // SIGKILLed the app. Let mpv copy the frame instead -- one extra
+          // memcpy is cheaper than a deadlock.
+          'vd-lavc-dr': 'no',
           'dither': 'fruit',
         } else ...{
           'dither': 'no',
