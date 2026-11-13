@@ -14,6 +14,7 @@
 
 #import <Metal/Metal.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -111,6 +112,9 @@ static void OnMpvRenderUpdate(void *ctx) {
   int _height;
   bool _deviceLost;
   bool _loggedFirstFrame;
+  // -render is lock-free now, so it needs a cheap way to notice that
+  // -shutdown already tore the render context down on another thread.
+  std::atomic<bool> _shuttingDown;
   NSString *_backend;
 
   std::mutex _mutex;
@@ -135,6 +139,7 @@ static void OnMpvRenderUpdate(void *ctx) {
   _width = width;
   _height = height;
   _deviceLost = false;
+  _shuttingDown = false;
 
   // MoltenVK aborts the process (instead of failing) when there is no Metal
   // device, e.g. in a GPU-less VM.
@@ -547,8 +552,16 @@ static void OnMpvRenderUpdate(void *ctx) {
 }
 
 - (BOOL)render {
-  std::lock_guard<std::mutex> lock(_mutex);
-  if (!_rc || _slots.empty() || _deviceLost) return NO;
+  // Deliberately lock-free. -render only ever runs on VideoOutput's single
+  // worker thread, and -resizeWidth runs on that same thread (VideoOutput
+  // calls texture.resize() immediately before texture.render()). Holding
+  // _mutex across the render + GPU wait was what made playback stutter:
+  // Flutter calls -copyPixelBuffer on the *main* thread, which also needs
+  // _mutex, so the main thread blocked for as long as the GPU took to finish
+  // a frame -- and while the main thread is blocked it cannot service mpv's
+  // update callback, which is exactly the "mpv_render_context_render() not
+  // being called or stuck" warning in the log.
+  if (!_rc || _slots.empty() || _deviceLost || _shuttingDown) return NO;
 
   uint64_t flags = mpv_render_context_update(_rc);
   if (!(flags & MPV_RENDER_UPDATE_FRAME)) return NO;
@@ -585,24 +598,36 @@ static void OnMpvRenderUpdate(void *ctx) {
   }
 
   // Flutter samples the CVPixelBuffer without any GPU synchronisation, so the
-  // frame must be complete before we hand it over. Waiting here also bounds
-  // the ring: a slot is never reused while mpv's GPU work on it is pending.
+  // frame must be complete before we hand it over. 100ms is ~2.4 frame times
+  // at 4K24: long enough that a healthy GPU never hits it, short enough that
+  // a wedged one drops this frame instead of stalling the pipeline. On
+  // timeout we still swap, so the next frame gets a fresh slot.
   uint64_t waitValue = _timelineValue;
   VkSemaphoreWaitInfo wi = {};
   wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
   wi.semaphoreCount = 1;
   wi.pSemaphores = &_timeline;
   wi.pValues = &waitValue;
-  VkResult r = vkWaitSemaphores(_dev, &wi, 1000ull * 1000ull * 1000ull);
-  if (r != VK_SUCCESS) {
-    if (r == VK_ERROR_DEVICE_LOST) _deviceLost = true;
-    NSLog(@"TextureVK: vkWaitSemaphores returned %d", r);
+  VkResult r = vkWaitSemaphores(_dev, &wi, 100ull * 1000ull * 1000ull);
+  if (r == VK_ERROR_DEVICE_LOST) {
+    _deviceLost = true;
+    NSLog(@"TextureVK: device lost while waiting for the frame");
+    mpv_render_context_report_swap(_rc);
+    return NO;
+  }
+  if (r == VK_TIMEOUT) {
+    // Do not publish a half-rendered slot.
+    NSLog(@"TextureVK: frame not ready after 100ms, dropping it");
     mpv_render_context_report_swap(_rc);
     return NO;
   }
 
-  _readySlot = slotIndex;
-  _writeSlot = (slotIndex + 1) % (int)_slots.size();
+  {
+    // Only the slot handover needs the lock, and it is a two-word update.
+    std::lock_guard<std::mutex> lock(_mutex);
+    _readySlot = slotIndex;
+    _writeSlot = (slotIndex + 1) % (int)_slots.size();
+  }
   mpv_render_context_report_swap(_rc);
   if (!_loggedFirstFrame) {
     _loggedFirstFrame = true;
@@ -613,7 +638,11 @@ static void OnMpvRenderUpdate(void *ctx) {
 }
 
 - (nullable CVPixelBufferRef)copyPixelBuffer CF_RETURNS_RETAINED {
-  std::lock_guard<std::mutex> lock(_mutex);
+  // Runs on the main thread and must never block it. If the render thread is
+  // mid-handover, return nothing and let Flutter reuse the frame it already
+  // holds rather than stalling the whole UI for a vsync.
+  std::unique_lock<std::mutex> lock(_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) return nullptr;
   if (_readySlot < 0 || _readySlot >= (int)_slots.size()) return nullptr;
   CVPixelBufferRef pb = _slots[_readySlot].pb;
   if (!pb) return nullptr;
@@ -621,6 +650,10 @@ static void OnMpvRenderUpdate(void *ctx) {
 }
 
 - (void)shutdown {
+  // Publish the flag before taking the lock: -render is lock-free, so this is
+  // the only thing that stops it from touching a render context that is about
+  // to be freed.
+  _shuttingDown = true;
   std::lock_guard<std::mutex> lock(_mutex);
   // Must precede device destruction: mpv owns objects on this VkDevice.
   if (_rc) {

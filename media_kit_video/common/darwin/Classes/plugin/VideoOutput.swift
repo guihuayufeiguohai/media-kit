@@ -222,7 +222,15 @@ public class VideoOutput: NSObject {
     }
 
     texture.render(size)
-    DispatchQueue.main.sync { [weak self] in
+    // Async on purpose. This runs on Worker's single thread, so a synchronous
+    // hop makes the render loop wait for whatever the main thread is doing
+    // (Flutter's own compositing, layout, a platform channel...). At 24fps
+    // that is usually invisible; the moment one main-thread frame runs long,
+    // the render queue backs up behind it and playback stutters for seconds.
+    // -textureFrameAvailable only marks the texture dirty, so ordering against
+    // the next -render is not required -- Flutter samples whichever slot is
+    // current when it gets around to compositing.
+    DispatchQueue.main.async { [weak self] in
       guard let that = self else { return }
       // Textures must be marked as available from the main thread
       that.registry.textureFrameAvailable(that.textureId)

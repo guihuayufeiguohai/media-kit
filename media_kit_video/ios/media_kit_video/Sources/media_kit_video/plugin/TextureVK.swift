@@ -51,13 +51,17 @@ public class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     super.init()
 
-    // mpv calls this from its own thread. Hop to main like TextureHW does, so
-    // VideoOutput.updateCallback() sees exactly the same threading as the
-    // OpenGL path. `weak self` breaks the renderer -> block -> self cycle.
+    // mpv calls this from its own thread. Go straight to VideoOutput: its
+    // updateCallback() only enqueues onto Worker's serial thread, and the
+    // parts that genuinely need the main thread (textureUpdateCallback,
+    // textureFrameAvailable) are already dispatched there from
+    // _updateCallback. Routing through DispatchQueue.main.async here added a
+    // full main-thread round trip per frame, so any long main-thread frame
+    // (layout, a platform channel, Flutter compositing) directly delayed
+    // rendering and eventually tripped mpv's "render() not being called"
+    // watchdog. `weak self` breaks the renderer -> block -> self cycle.
     renderer.onUpdate = { [weak self] in
-      DispatchQueue.main.async {
-        self?.updateCallback()
-      }
+      self?.updateCallback()
     }
 
     NSLog("TextureVK: \(renderer.backendDescription)")
