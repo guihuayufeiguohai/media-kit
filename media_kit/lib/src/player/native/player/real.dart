@@ -2501,11 +2501,17 @@ class NativePlayer extends PlatformPlayer {
           // Measured against the HDR10 tone-mapping test pattern on an A15:
           // of 21 patches (240..1000 nits), the number that stay visibly
           // distinct is 6 at 150, 8 at 200, 11 at 300, 13 at 400, 14 at 450
-          // and 19 at 600. 600 resolves the most but crushes the whole image
-          // (first patch drops to 168/255); 450 keeps 14 steps while holding
-          // 191/255. SDR content never goes through tone mapping, so this
-          // only affects HDR.
-          'target-peak': '450',
+          // and 19 at 600.
+          //
+          // 600 resolves the most but crushes the whole image (first patch
+          // drops to 168/255), and 450 -- which is best for the test pattern
+          // -- makes real Dolby Vision content visibly darker than 100,
+          // because DV grades most of the image around 100-200 nits and a
+          // target of 450 pushes that into the lower half of the range. 250
+          // sits between: enough highlight separation to keep the top
+          // patches apart, without dimming ordinary content. SDR never goes
+          // through tone mapping, so it is unaffected either way.
+          'target-peak': '250',
           'target-contrast': '1000',
           'tone-mapping': 'bt.2390',
           'tone-mapping-mode': 'rgb',
