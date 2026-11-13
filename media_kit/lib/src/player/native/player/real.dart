@@ -2503,15 +2503,14 @@ class NativePlayer extends PlatformPlayer {
           // distinct is 6 at 150, 8 at 200, 11 at 300, 13 at 400, 14 at 450
           // and 19 at 600.
           //
-          // 600 resolves the most but crushes the whole image (first patch
-          // drops to 168/255), and 450 -- which is best for the test pattern
-          // -- makes real Dolby Vision content visibly darker than 100,
-          // because DV grades most of the image around 100-200 nits and a
-          // target of 450 pushes that into the lower half of the range. 250
-          // sits between: enough highlight separation to keep the top
-          // patches apart, without dimming ordinary content. SDR never goes
-          // through tone mapping, so it is unaffected either way.
-          'target-peak': '250',
+          // Those numbers only matter for a synthetic full-range pattern.
+          // Real Dolby Vision grades sit around 100-200 nits, so a high
+          // target pushes the whole picture into the lower half of the range
+          // and it looks dim -- 450 was clearly worse than 100 in practice.
+          // 135 keeps ordinary content at roughly the brightness the SDR
+          // reference expects while still leaving the top of the curve some
+          // room. SDR never goes through tone mapping, so it is unaffected.
+          'target-peak': '135',
           'target-contrast': '1000',
           'tone-mapping': 'bt.2390',
           'tone-mapping-mode': 'rgb',
