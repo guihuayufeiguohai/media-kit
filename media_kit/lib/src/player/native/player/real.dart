@@ -2484,9 +2484,10 @@ class NativePlayer extends PlatformPlayer {
         //   histogram pass for free.
         //
         // target-peak: a windowless render API cannot probe a display, so
-        //   "auto" falls back to libplacebo's 100 nits, which is exactly SDR
-        //   reference white. Raising it does not make HDR "brighter", it only
-        //   clips highlights earlier. The dimness comes from the curve below.
+        //   "auto" falls back to libplacebo's 100 nits. On an 8-bit target
+        //   100 crushes the top half of an HDR10 master into pure white;
+        //   450 trades a little midtone brightness for far more highlight
+        //   separation (see the measurements next to the value).
         //
         // tone-mapping: "auto" picks spline in gpu-next, and spline rolls off
         //   the low and mid tones too when target is far below source peak --
@@ -2497,7 +2498,14 @@ class NativePlayer extends PlatformPlayer {
         // dither: 8-bit BGRA output plus 4K tone mapping bands without it.
         if (Platform.isIOS || Platform.isMacOS) ...{
           'hdr-compute-peak': 'yes',
-          'target-peak': '100',
+          // Measured against the HDR10 tone-mapping test pattern on an A15:
+          // of 21 patches (240..1000 nits), the number that stay visibly
+          // distinct is 6 at 150, 8 at 200, 11 at 300, 13 at 400, 14 at 450
+          // and 19 at 600. 600 resolves the most but crushes the whole image
+          // (first patch drops to 168/255); 450 keeps 14 steps while holding
+          // 191/255. SDR content never goes through tone mapping, so this
+          // only affects HDR.
+          'target-peak': '450',
           'target-contrast': '1000',
           'tone-mapping': 'bt.2390',
           'tone-mapping-mode': 'rgb',
