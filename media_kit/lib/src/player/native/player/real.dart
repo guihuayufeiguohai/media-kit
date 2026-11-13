@@ -2466,7 +2466,6 @@ class NativePlayer extends PlatformPlayer {
         // https://github.com/mpv-android/mpv-android/commit/9e5c3d8a630290fc41edb8b03aeafa3bc4c45955
         'scale': 'bilinear',
         'dscale': 'bilinear',
-        'dither': 'no',
         'cache': 'yes',
         'cache-on-disk': 'yes',
         'hr-seek': 'yes',
@@ -2474,7 +2473,39 @@ class NativePlayer extends PlatformPlayer {
         'correct-downscaling': 'no',
         'linear-downscaling': 'no',
         'sigmoid-upscaling': 'no',
-        'hdr-compute-peak': 'no',
+        // HDR -> SDR mapping. Each of these replaces a default that shows up
+        // as a visible defect on Apple GPUs:
+        //
+        // hdr-compute-peak: mpv-android turns this off to save power. With it
+        //   off libplacebo can only use the container's static maxCLL (1000
+        //   for most HDR10 masters, sometimes 4000), so a title whose real
+        //   peak is 300-400 nits gets compressed as if it were the worst case
+        //   and the whole picture looks dim. An A-series GPU does this
+        //   histogram pass for free.
+        //
+        // target-peak: a windowless render API cannot probe a display, so
+        //   "auto" falls back to libplacebo's 100 nits, which is exactly SDR
+        //   reference white. Raising it does not make HDR "brighter", it only
+        //   clips highlights earlier. The dimness comes from the curve below.
+        //
+        // tone-mapping: "auto" picks spline in gpu-next, and spline rolls off
+        //   the low and mid tones too when target is far below source peak --
+        //   that is the "HDR looks darker than SDR" symptom. bt.2390 compresses
+        //   only the highlights and stays linear below the knee, which is what
+        //   HDR10 mastering assumes.
+        //
+        // dither: 8-bit BGRA output plus 4K tone mapping bands without it.
+        if (Platform.isIOS || Platform.isMacOS) ...{
+          'hdr-compute-peak': 'yes',
+          'target-peak': '100',
+          'target-contrast': '1000',
+          'tone-mapping': 'bt.2390',
+          'tone-mapping-mode': 'rgb',
+          'dither': 'fruit',
+        } else ...{
+          'dither': 'no',
+          'hdr-compute-peak': 'no',
+        },
         if (AndroidHelper.isPhysicalDevice || AndroidHelper.APILevel > 25)
           'ao': 'opensles'
         // Disable audio output on older Android emulators with API Level < 25.
