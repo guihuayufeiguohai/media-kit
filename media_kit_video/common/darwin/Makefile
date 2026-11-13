@@ -49,6 +49,10 @@ TAR=tar
 	touch .cache/headers/bundle.tar.gz
 
 ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h: .cache/headers/bundle.tar.gz
+	# See the note in libs/ios/media_kit_libs_ios_video/ios/Makefile: the
+	# unpacked tree is read-only, so without this chmod the second run cannot
+	# clear it and tar leaves vk_video partially populated.
+	chmod -R u+w .cache/headers/extract 2>/dev/null || true
 	rm -rf .cache/headers/extract
 	mkdir -p .cache/headers/extract
 	# mpv/ for the API, vulkan/ + vk_video/ because render_vk.h includes

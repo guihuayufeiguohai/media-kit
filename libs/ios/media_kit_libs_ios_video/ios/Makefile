@@ -48,6 +48,11 @@ SED_INPLACE_FLAG := $(shell ${SED} --version 2>&1 | grep -q 'GNU' && echo "" || 
 Frameworks/*.xcframework: .cache/bundle.tar.gz
 	mkdir -p Frameworks
 	rm -rf Frameworks/*.xcframework
+	# The bundle stores everything as 0555, so a second run cannot remove the
+	# tree it just unpacked: rm fails with EACCES and tar then skips every file
+	# that already exists ("Can't unlink already-existing object"), leaving a
+	# half-populated Frameworks directory that fails the guards below.
+	chmod -R u+w .cache/extract 2>/dev/null || true
 	rm -rf .cache/extract
 	mkdir -p .cache/extract
 	${TAR} -xvf .cache/bundle.tar.gz -C .cache/extract ./xcframework
