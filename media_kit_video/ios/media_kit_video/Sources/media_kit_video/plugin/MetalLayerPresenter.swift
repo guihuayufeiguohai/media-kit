@@ -49,6 +49,8 @@ import UIKit
     /// Frames since the last reconfig; sets the property poll rate. Both
     /// writers (`resized` and `present`) run on Worker.
     private var framesSinceResize = 0
+    /// One pixel-value probe per clip. See `probeFrameRange`.
+    private var probePending = true
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -194,6 +196,7 @@ import UIKit
       // New content may mean a different transfer function. Restart the fast
       // poll so `syncLayerToMPV` re-tags the layer within a frame or two.
       framesSinceResize = 0
+      probePending = true
       DispatchQueue.main.sync {
         self.onResize(-1, size, .metalLayer)
       }
@@ -234,6 +237,9 @@ import UIKit
       // nowhere to put an HDR transfer, and `syncLayerToMPV` never reports one.
       let hdr = edrCapable && MetalLayerPresenter.isHDR(gamma)
       appliedHDR = hdr
+      // Only once mpv has actually answered: before that we would be undoing
+      // Dart's PQ request and then re-applying it one frame later.
+      if gamma != nil { applyMPVTarget(hdr: hdr) }
       guard let layer = view?.layer as? CAMetalLayer else { return }
 
       let format: MTLPixelFormat = hdr ? .rgba16Float : .bgra8Unorm
@@ -261,6 +267,99 @@ import UIKit
 
     private static func isHDR(_ gamma: String?) -> Bool {
       gamma == "pq" || gamma == "hlg"
+    }
+
+    /// Samples a sparse grid of the frame mpv just produced and logs its range.
+    /// One shot per clip; runs on `presentQueue`.
+    ///
+    /// This is the only honest answer to "what is in the ring": every mpv
+    /// property describes the frame *before* the GPU chain, and that chain is
+    /// free to convert to the target. A bright SDR frame reads `max≈1.000` when
+    /// the ring is coded (bt.1886 / sRGB / rescaled linear), and `max≈0.51`
+    /// when it is PQ -- PQ places SDR white at 100 nits, code 0.508.
+    private func probeFrameRange(_ pixelBuffer: CVPixelBuffer) {
+      // The pod targets iOS 9; `Float16` needs 14. The layer sink itself is
+      // iOS 16+, so this only ever returns early on builds that never run it.
+      guard #available(iOS 14.0, *) else { return }
+      guard
+        CVPixelBufferGetPixelFormatType(pixelBuffer)
+          == kCVPixelFormatType_64RGBAHalf,
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess
+      else {
+        NSLog("MetalLayer: probe skipped (not 64RGBAHalf or not CPU-readable)")
+        return
+      }
+      defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+      guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+
+      let width = CVPixelBufferGetWidth(pixelBuffer)
+      let height = CVPixelBufferGetHeight(pixelBuffer)
+      let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+      // Every 32nd pixel: ~1500 samples at 1080p, enough for a max/mean and
+      // cheap enough to stay off the frame budget.
+      let step = 32
+      var maximum: Float = 0
+      var sum: Float = 0
+      var count = 0
+      var y = 0
+      while y < height {
+        let row = base.advanced(by: y * rowBytes)
+          .assumingMemoryBound(to: UInt16.self)
+        var x = 0
+        while x < width {
+          let i = x * 4
+          let value = max(
+            Float(Float16(bitPattern: row[i])),
+            max(
+              Float(Float16(bitPattern: row[i + 1])),
+              Float(Float16(bitPattern: row[i + 2]))
+            )
+          )
+          if value > maximum { maximum = value }
+          sum += value
+          count += 1
+          x += step
+        }
+        y += step
+      }
+      let mean = count > 0 ? sum / Float(count) : 0
+      NSLog(
+        "MetalLayer: probe max=\(String(format: "%.3f", maximum)) mean=\(String(format: "%.3f", mean)) samples=\(count) tagged=\(appliedHDR == true ? "pq" : "srgb")"
+      )
+    }
+
+    /// Keeps mpv's own target in step with the clip, not with the config.
+    ///
+    /// Dart sets `target-trc=pq` / `target-prim=bt.2020` / `target-peak=1000`
+    /// once at `create()`, before anything is playing. For an HDR clip that is
+    /// exactly right. For an SDR clip it leaves mpv believing the display is an
+    /// HDR one, and the picture no longer matches the verified SDR path (C3),
+    /// where those options were never touched -- that is the residual
+    /// grey-white cast on SDR after the drawable was fixed.
+    ///
+    /// Bounded by construction: the desired value comes from the *source*
+    /// transfer (`video-out-params/gamma`), so writing `target-trc` cannot feed
+    /// back into the reading that drives it.
+    ///
+    /// Main thread only. mpv marshals property writes onto the play loop, which
+    /// can be waiting for the render thread -- writing from Worker is the C4.1
+    /// deadlock in a new costume.
+    private func applyMPVTarget(hdr: Bool) {
+      guard edrCapable, let handle = mpvHandle else { return }
+      let trc = hdr ? "pq" : "auto"
+      // mpv reports the current choice back as a string ("pq"/"auto"/...).
+      guard MPVHelpers.getStringProperty(handle, "target-trc") != trc else {
+        return
+      }
+      let ok = MPVHelpers.setStringProperty(handle, "target-trc", trc)
+      var allOk = MPVHelpers.setStringProperty(
+        handle, "target-prim", hdr ? "bt.2020" : "auto")
+      allOk =
+        MPVHelpers.setStringProperty(
+          handle, "target-peak", hdr ? "1000" : "auto") && allOk
+      NSLog(
+        "MetalLayer: mpv target -> trc=\(trc) prim=\(hdr ? "bt.2020" : "auto") peak=\(hdr ? "1000" : "auto")\(ok && allOk ? "" : " FAILED")"
+      )
     }
 
     /// Asks mpv which transfer function the frames in the ring are in.
@@ -370,6 +469,16 @@ import UIKit
         inflight.signal()
         skippedNil += 1
         return
+      }
+
+      // Numbers beat reasoning here: `video-out-params` is the vf chain's
+      // output, NOT what the GPU wrote into the ring, so it cannot tell us
+      // whether mpv converted to PQ in the shader. A bright frame has max=1.0
+      // if the ring is coded (bt.1886/sRGB/linear-scaled), and ≈0.51 if it is
+      // PQ (SDR white = 100 nits = PQ 0.508).
+      if probePending {
+        probePending = false
+        probeFrameRange(pixelBuffer)
       }
 
       // Picked from the drawable, not from `appliedHDR`: the format can change

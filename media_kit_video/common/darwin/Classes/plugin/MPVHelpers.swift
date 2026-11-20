@@ -27,6 +27,26 @@ public enum MPVHelpers {
     return value.isEmpty ? nil : value
   }
 
+  /// Writes a string property. Returns false if mpv rejected it.
+  ///
+  /// `mpv_set_property_string` blocks on the core's play loop, so this must not
+  /// be called from the render thread (see P9 / C4.1).
+  @discardableResult
+  public static func setStringProperty(
+    _ handle: OpaquePointer,
+    _ name: String,
+    _ value: String
+  ) -> Bool {
+    let status = mpv_set_property_string(handle, name, value)
+    if status < 0 {
+      NSLog(
+        "MPVHelpers: set \(name)=\(value) failed: \(String(cString: mpv_error_string(status)))"
+      )
+      return false
+    }
+    return true
+  }
+
   public static func getVideoOutParams(
     _ handle: OpaquePointer
   ) -> MPVVideoOutParams {
