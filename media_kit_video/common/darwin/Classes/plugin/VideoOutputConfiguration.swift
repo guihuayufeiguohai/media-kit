@@ -9,19 +9,24 @@ public class VideoOutputConfiguration {
   /// Only meaningful together with `.metalLayer` -- Flutter's external texture
   /// path rejects anything but BGRA8.
   public let pixelFormat16F: Bool
+  /// Present in HDR (PQ) instead of tone mapping down to SDR. Implies
+  /// `pixelFormat16F`; `.metalLayer` only.
+  public let outputEDR: Bool
 
   init(
     width: Int64?,
     height: Int64?,
     enableHardwareAcceleration: Bool,
     outputMode: VideoOutputMode = .texture,
-    pixelFormat16F: Bool = false
+    pixelFormat16F: Bool = false,
+    outputEDR: Bool = false
   ) {
     self.width = width
     self.height = height
     self.enableHardwareAcceleration = enableHardwareAcceleration
     self.outputMode = outputMode
     self.pixelFormat16F = pixelFormat16F
+    self.outputEDR = outputEDR
   }
 
   public static func fromDict(_ dict: [String: Any])
@@ -38,6 +43,7 @@ public class VideoOutputConfiguration {
       (dict["outputMode"] as? String).flatMap(VideoOutputMode.init(rawValue:))
       ?? .texture
     let pixelFormat16F = dict["pixelFormat16F"] as? Bool ?? false
+    let outputEDR = dict["outputEDR"] as? Bool ?? false
 
     let width: Int64? = widthStr.flatMap { Int64($0) }
     let height: Int64? = heightStr.flatMap { Int64($0) }
@@ -47,7 +53,8 @@ public class VideoOutputConfiguration {
       height: height,
       enableHardwareAcceleration: enableHardwareAcceleration,
       outputMode: outputMode,
-      pixelFormat16F: pixelFormat16F
+      pixelFormat16F: pixelFormat16F,
+      outputEDR: outputEDR
     )
   }
 }

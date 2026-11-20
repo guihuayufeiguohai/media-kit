@@ -182,6 +182,20 @@ class VideoControllerConfiguration {
   /// Default: `false`
   final bool pixelFormat16F;
 
+  /// Present in HDR instead of tone mapping down to SDR.
+  ///
+  /// iOS + [outputMode] == [VideoOutputMode.metalLayer] only, and it implies
+  /// [pixelFormat16F]: an 8-bit drawable has no room for a PQ signal. Native
+  /// additionally requires a PQ capable `CAMetalLayer` colorspace, and falls
+  /// back to SDR if that is unavailable.
+  ///
+  /// When honoured, mpv stops tone mapping to `bt.709/srgb` and writes PQ
+  /// (`bt.2020/pq`) straight into the IOSurface, so highlights reach the
+  /// display's real peak instead of being compressed into 135 nits.
+  ///
+  /// Default: `false`
+  final bool outputEDR;
+
   /// {@macro video_controller_configuration}
   const VideoControllerConfiguration({
     this.vo,
@@ -193,6 +207,7 @@ class VideoControllerConfiguration {
     this.androidAttachSurfaceAfterVideoParameters,
     this.outputMode = VideoOutputMode.texture,
     this.pixelFormat16F = false,
+    this.outputEDR = false,
   });
 
   /// Returns a copy of this class with the given fields replaced by the new values.
@@ -206,6 +221,7 @@ class VideoControllerConfiguration {
     bool? androidAttachSurfaceAfterVideoParameters,
     VideoOutputMode? outputMode,
     bool? pixelFormat16F,
+    bool? outputEDR,
   }) =>
       VideoControllerConfiguration(
         vo: vo ?? this.vo,
@@ -220,5 +236,6 @@ class VideoControllerConfiguration {
                 this.androidAttachSurfaceAfterVideoParameters,
         outputMode: outputMode ?? this.outputMode,
         pixelFormat16F: pixelFormat16F ?? this.pixelFormat16F,
+        outputEDR: outputEDR ?? this.outputEDR,
       );
 }

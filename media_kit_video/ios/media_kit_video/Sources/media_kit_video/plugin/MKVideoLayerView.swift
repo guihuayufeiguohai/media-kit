@@ -101,6 +101,10 @@ import UIKit
 
     private func configureLayer() {
       metalLayer.device = MTLCreateSystemDefaultDevice()
+      // SDR defaults only. MetalLayerPresenter overrides pixelFormat,
+      // colorspace and wantsExtendedDynamicRangeContent from `attach` when it
+      // knows whether EDR actually came up -- this view is created by Flutter's
+      // platform view factory and only receives the mpv handle.
       // NOT `.bgra8Unorm_srgb`: the shader writes already-encoded values, and
       // an sRGB drawable would encode them a second time (washed out + wrong
       // contrast). Keep it linear-ish and let the colorspace do the mapping.

@@ -156,6 +156,9 @@ public class VideoOutput: NSObject {
   private let requestedMode: VideoOutputMode
   /// 16F intermediate instead of 8-bit BGRA. Layer sink only.
   private let requestedPixelFormat16F: Bool
+  /// Present in HDR instead of tone mapping to SDR. Layer sink only, and it
+  /// forces the 16F intermediate on: PQ cannot survive an 8-bit surface.
+  private let requestedEDR: Bool
   private var width: Int64?
   private var height: Int64?
   private var texture: ResizableTextureProtocol!
@@ -187,6 +190,7 @@ public class VideoOutput: NSObject {
     enableHardwareAcceleration = configuration.enableHardwareAcceleration
     requestedMode = configuration.outputMode
     requestedPixelFormat16F = configuration.pixelFormat16F
+    requestedEDR = configuration.outputEDR
     self.registry = registry
     self.textureUpdateCallback = textureUpdateCallback
 
@@ -235,7 +239,9 @@ public class VideoOutput: NSObject {
       {
         wantsLayer = true
       }
-      let halfFloat = wantsLayer && requestedPixelFormat16F
+      // EDR implies 16F: an 8-bit surface cannot carry PQ without banding so
+      // severe that the HDR part stops mattering.
+      let halfFloat = wantsLayer && (requestedPixelFormat16F || requestedEDR)
 
       // Kept out here so the sink selection below can tell "Vulkan is
       // available" apart from "we fell back to TextureSW".
@@ -328,6 +334,7 @@ public class VideoOutput: NSObject {
         layerPresenter = MetalLayerPresenter(
           renderer: texture,
           pixelFormat16F: halfFloat,
+          outputEDR: requestedEDR,
           onResize: textureUpdateCallback
         )
         if layerPresenter == nil {

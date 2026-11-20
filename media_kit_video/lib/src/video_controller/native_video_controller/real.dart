@@ -199,6 +199,7 @@ class NativeVideoController extends PlatformVideoController {
               configuration.enableHardwareAcceleration,
           'outputMode': configuration.outputMode.wire,
           'pixelFormat16F': configuration.pixelFormat16F,
+          'outputEDR': configuration.outputEDR,
         },
       },
     );
@@ -206,6 +207,30 @@ class NativeVideoController extends PlatformVideoController {
     await completer.future;
     controller.id.removeListener(listener);
     controller.mode.removeListener(listener);
+
+    // Point mpv at PQ only once the layer sink is actually in use.
+    //
+    // The external texture path is 8-bit BGRA end to end, so asking for PQ
+    // there would just produce a dark, washed-out picture with nothing
+    // downstream able to fix it. The native side is the final arbiter of the
+    // sink, hence checking [mode] instead of the requested configuration.
+    if (configuration.outputEDR &&
+        controller.mode.value == VideoOutputMode.metalLayer) {
+      // This is a static factory, so reach the player through the argument
+      // rather than the (instance) `platform` getter.
+      final mpv = player.platform as NativePlayer;
+      // 1000 nits is a deliberate under-ask: iPhone panels peak somewhere
+      // around 1200, and iOS tone maps an EDR layer down when the current
+      // headroom is lower anyway. Asking for less than the panel can do keeps
+      // highlight detail instead of clipping it on the devices that fall short.
+      await mpv.setProperty('target-prim', 'bt.2020');
+      await mpv.setProperty('target-trc', 'pq');
+      await mpv.setProperty('target-peak', '1000');
+      await mpv.setProperty('target-contrast', 'auto');
+      debugPrint(
+        'NativeVideoController: EDR output: pq/bt.2020/1000nits',
+      );
+    }
 
     // Return the [VideoController].
     return controller;

@@ -27,6 +27,14 @@ import UIKit
     private let pipeline: MTLRenderPipelineState
     /// Must match what MKVulkanRenderer produces: 32BGRA or 64RGBAHalf.
     private let sourceFormat: MTLPixelFormat
+    /// What the drawable is set to. `.rgba16Float` only when EDR is actually
+    /// active -- see `init`.
+    private let drawableFormat: MTLPixelFormat
+    /// PQ (`ITU-R BT.2100`) when EDR is active, nil otherwise.
+    private let drawableColorspace: CGColorSpace?
+    /// False if EDR was requested but CoreGraphics had no PQ colorspace: the
+    /// layer then stays SDR and the 16F drawable would only waste bandwidth.
+    private let outputEDR: Bool
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -59,6 +67,7 @@ import UIKit
     init?(
       renderer: ResizableTextureProtocol,
       pixelFormat16F: Bool,
+      outputEDR: Bool = false,
       onResize: @escaping VideoOutput.TextureUpdateCallback
     ) {
       guard let device = MTLCreateSystemDefaultDevice(),
@@ -92,13 +101,31 @@ import UIKit
         return nil
       }
 
+      // EDR is only worth it if CoreGraphics can hand us a PQ colorspace.
+      // Without it the drawable would be tagged sRGB, the PQ code values would
+      // be read as sRGB and the picture would come out dark and desaturated --
+      // worse than plain SDR, not better.
+      var pqColorspace: CGColorSpace? = nil
+      if outputEDR {
+        pqColorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+        if pqColorspace == nil {
+          NSLog("MetalLayer: PQ colorspace unavailable, staying SDR")
+        }
+      }
+      let edr = pqColorspace != nil
+      // 16F for EDR: a 10-bit drawable would work too, but the source is
+      // already 16F and staying float keeps the whole path unquantised until
+      // the compositor.
+      let drawableFormat: MTLPixelFormat = edr ? .rgba16Float : .bgra8Unorm
+
       let descriptor = MTLRenderPipelineDescriptor()
       descriptor.vertexFunction = vertexFn
       descriptor.fragmentFunction = fragmentFn
-      // Must match MKVideoLayerView's layer pixel format. NOT `.bgra8Unorm_srgb`:
-      // the shader writes already-encoded values, and an sRGB attachment would
-      // encode them a second time.
-      descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+      // Must match the layer's pixel format, which `attach` sets from
+      // `drawableFormat`. NOT `.bgra8Unorm_srgb`: the shader writes
+      // already-encoded values, and an sRGB attachment would encode them a
+      // second time.
+      descriptor.colorAttachments[0].pixelFormat = drawableFormat
       guard let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
       else {
         NSLog("MetalLayer: makeRenderPipelineState failed")
@@ -113,6 +140,9 @@ import UIKit
       self.sampler = sampler
       self.pipeline = pipeline
       self.sourceFormat = pixelFormat16F ? .rgba16Float : .bgra8Unorm
+      self.drawableFormat = drawableFormat
+      self.drawableColorspace = pqColorspace
+      self.outputEDR = edr
 
       super.init()
 
@@ -130,7 +160,7 @@ import UIKit
       )
 
       NSLog(
-        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8")"
+        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(edr ? 1 : 0)"
       )
     }
 
@@ -155,9 +185,34 @@ import UIKit
       self.view = view
       stateLock.unlock()
       if let view = view {
-        NSLog("MetalLayer: attached \(view.bounds.size)")
+        configureLayer(of: view)
+        NSLog(
+          "MetalLayer: attached \(view.bounds.size) dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(outputEDR ? 1 : 0)"
+        )
       } else {
         NSLog("MetalLayer: detached")
+      }
+    }
+
+    /// Called on the main thread, before the first drawable is requested.
+    ///
+    /// The drawable format and colorspace live on the layer, not here, and
+    /// `MKVideoLayerView` cannot know them: it is created by Flutter's platform
+    /// view factory, which only receives the mpv handle. The presenter is the
+    /// only object that knows both the requested configuration and whether EDR
+    /// actually came up, so it takes over.
+    private func configureLayer(of view: UIView) {
+      guard let layer = view.layer as? CAMetalLayer else { return }
+      // Guarded: assigning `pixelFormat` discards existing drawables, and a
+      // re-attach (route push/pop, Hero) must not throw away a frame.
+      if layer.pixelFormat != drawableFormat {
+        layer.pixelFormat = drawableFormat
+      }
+      if let colorspace = drawableColorspace {
+        layer.colorspace = colorspace
+      }
+      if #available(iOS 16.0, *) {
+        layer.wantsExtendedDynamicRangeContent = outputEDR
       }
     }
 
@@ -314,7 +369,7 @@ import UIKit
       if !firstPresentLogged {
         firstPresentLogged = true
         NSLog(
-          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8")"
+          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(outputEDR ? 1 : 0)"
         )
       }
       let now = CACurrentMediaTime()
