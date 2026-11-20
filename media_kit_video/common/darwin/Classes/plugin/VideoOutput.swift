@@ -222,6 +222,12 @@ public class VideoOutput: NSObject {
       )
     }
 
+    #if os(iOS)
+      // Kept out here so the sink selection below can tell "Vulkan is
+      // available" apart from "we fell back to TextureSW".
+      var vkTexture: TextureVK?
+    #endif
+
     if enableHardwareAcceleration {
       // Vulkan first: gpu-next is the only renderer that handles Dolby Vision
       // (IPT-PQ-C2) correctly. TextureVK returns nil when MoltenVK or mpv's
@@ -242,6 +248,7 @@ public class VideoOutput: NSObject {
             that.updateCallback()
           }
         ) {
+          vkTexture = vulkanTexture
           texture = SafeResizableTexture(vulkanTexture)
           createdTexture = true
         }
@@ -300,23 +307,37 @@ public class VideoOutput: NSObject {
     }
 
     // ---- choose the sink ---------------------------------------------------
-    //
-    // C1 has exactly one sink on purpose. `VideoOutputMode.metalLayer` is
-    // plumbed end-to-end (configuration -> channel -> `mode` notifier ->
-    // widget) but not honoured here yet: C2 adds MetalLayerPresenter and the
-    // branch that selects it. Keeping a single path is what makes "zero
-    // behaviour change" checkable -- if the picture moves at all, it is a bug.
-    if requestedMode == .metalLayer {
-      NSLog(
-        "VideoOutput: metalLayer requested but not wired in C1, staying on texture"
+    var layerPresenter: VideoFramePresenter?
+    #if os(iOS)
+      if #available(iOS 16.0, *), requestedMode == .metalLayer, vkTexture != nil {
+        layerPresenter = MetalLayerPresenter(
+          renderer: texture,
+          onResize: textureUpdateCallback
+        )
+        if layerPresenter == nil {
+          NSLog(
+            "VideoOutput: MetalLayerPresenter unavailable, falling back to texture"
+          )
+        }
+      } else if requestedMode == .metalLayer {
+        // iOS 15, or no Vulkan renderer: the layer sink is not usable here.
+        NSLog(
+          "VideoOutput: metalLayer not available here, falling back to texture"
+        )
+      }
+    #endif
+
+    if let layerPresenter = layerPresenter {
+      presenter = layerPresenter
+      NSLog("VideoOutput: output=metalLayer")
+    } else {
+      presenter = TexturePresenter(
+        texture: texture,
+        registry: registry,
+        onResize: textureUpdateCallback
       )
+      NSLog("VideoOutput: output=texture")
     }
-    presenter = TexturePresenter(
-      texture: texture,
-      registry: registry,
-      onResize: textureUpdateCallback
-    )
-    NSLog("VideoOutput: output=texture")
 
     DispatchQueue.main.sync { [weak self]() in
       guard let that = self else {
