@@ -24,16 +24,20 @@
 namespace {
 
 constexpr int kRingSize = 3;
-// 8-bit is a hard ceiling on this path. Flutter's
+// Two intermediate formats. Both are IOSurface-backed and imported through
+// VK_EXT_metal_objects, so no pixel data is ever copied -- the only difference
+// is how many bits reach the sink.
+//
+// 8-bit BGRA is what Flutter's external texture path requires:
 // FlutterDarwinExternalTextureMetal only accepts kCVPixelFormatType_32BGRA and
-// kCVPixelFormatType_420YpCbCr8BiPlanar{Video,Full}Range; handing it a 10-bit
-// buffer (kCVPixelFormatType_ARGB2101010LEPacked, FourCC 'l10r') is rejected
-// with "Unsupported pixel format: 1815162994" and the texture never appears.
-// Flutter's own CAMetalLayer is MTLPixelFormatBGR10_XR, so the precision is
-// there in the compositor -- it just cannot be reached through FlutterTexture
-// until the engine learns to sample 10-bit external textures.
-constexpr VkFormat kFormat = VK_FORMAT_B8G8R8A8_UNORM;
-constexpr OSType kPixelFormat = kCVPixelFormatType_32BGRA;
+// kCVPixelFormatType_420YpCbCr8BiPlanar{Video,Full}Range, and rejects 10-bit
+// buffers (kCVPixelFormatType_ARGB2101010LEPacked, FourCC 'l10r') with
+// "Unsupported pixel format: 1815162994".
+//
+// 16F is for the CAMetalLayer sink, where Flutter's compositor is not in the
+// loop. The layer itself is still bgra8Unorm in this round, so the extra
+// precision is quantised away at the very end -- this gate only proves that
+// the 16F IOSurface import survives the MoltenVK/libplacebo path.
 constexpr VkImageUsageFlags kUsage =
     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -118,6 +122,11 @@ static void OnMpvRenderUpdate(void *ctx) {
   int _readySlot;
   int _width;
   int _height;
+  // The intermediate format picked at init time. Both the CVPixelBuffer and the
+  // VkImage must agree, otherwise MoltenVK refuses to import the IOSurface.
+  VkFormat _format;
+  OSType _pixelFormat;
+  bool _halfFloat;
   bool _deviceLost;
   bool _loggedFirstFrame;
   // -render is lock-free now, so it needs a cheap way to notice that
@@ -134,6 +143,18 @@ static void OnMpvRenderUpdate(void *ctx) {
                                      width:(int)width
                                     height:(int)height
                                      error:(NSString *_Nullable *_Nullable)error {
+  return [self initWithMpvHandle:handle
+                           width:width
+                          height:height
+                       halfFloat:NO
+                           error:error];
+}
+
+- (nullable instancetype)initWithMpvHandle:(void *)handle
+                                     width:(int)width
+                                    height:(int)height
+                                 halfFloat:(BOOL)halfFloat
+                                     error:(NSString *_Nullable *_Nullable)error {
   self = [super init];
   if (!self) return nil;
 
@@ -148,6 +169,13 @@ static void OnMpvRenderUpdate(void *ctx) {
   _height = height;
   _deviceLost = false;
   _shuttingDown = false;
+
+  _halfFloat = halfFloat;
+  _format = halfFloat ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_B8G8R8A8_UNORM;
+  _pixelFormat = halfFloat ? kCVPixelFormatType_64RGBAHalf : kCVPixelFormatType_32BGRA;
+  NSLog(@"TextureVK: target format=%s pb=%s ring=%d",
+        halfFloat ? "R16G16B16A16_SFLOAT" : "B8G8R8A8_UNORM",
+        halfFloat ? "64RGBAHalf" : "32BGRA", kRingSize);
 
   // MoltenVK aborts the process (instead of failing) when there is no Metal
   // device, e.g. in a GPU-less VM.
@@ -410,7 +438,7 @@ static void OnMpvRenderUpdate(void *ctx) {
   };
   CVPixelBufferRef pb = nullptr;
   if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)width, (size_t)height,
-                          kPixelFormat,
+                          _pixelFormat,
                           (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
     SetError(error, @"CVPixelBufferCreate failed");
     return NO;
@@ -431,7 +459,7 @@ static void OnMpvRenderUpdate(void *ctx) {
   ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   ici.pNext = &import;
   ici.imageType = VK_IMAGE_TYPE_2D;
-  ici.format = kFormat;
+  ici.format = _format;
   ici.extent = {(uint32_t)width, (uint32_t)height, 1};
   ici.mipLevels = 1;
   ici.arrayLayers = 1;
@@ -585,7 +613,7 @@ static void OnMpvRenderUpdate(void *ctx) {
   _timelineValue += 1;
   mpv_vulkan_image target = {};
   target.image = slot.image;
-  target.format = kFormat;
+  target.format = _format;
   target.usage = kUsage;
   target.width = slot.width;
   target.height = slot.height;

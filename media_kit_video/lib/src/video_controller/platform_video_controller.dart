@@ -171,6 +171,17 @@ class VideoControllerConfiguration {
   /// Default: [VideoOutputMode.texture]
   final VideoOutputMode outputMode;
 
+  /// Use a 16-bit float intermediate (`kCVPixelFormatType_64RGBAHalf`) instead
+  /// of 8-bit BGRA.
+  ///
+  /// iOS + [outputMode] == [VideoOutputMode.metalLayer] only. Must stay false
+  /// otherwise: Flutter's external texture path rejects anything but BGRA8 with
+  /// "Unsupported pixel format". Native ignores it when the layer sink is not
+  /// selected.
+  ///
+  /// Default: `false`
+  final bool pixelFormat16F;
+
   /// {@macro video_controller_configuration}
   const VideoControllerConfiguration({
     this.vo,
@@ -181,6 +192,7 @@ class VideoControllerConfiguration {
     this.enableHardwareAcceleration = true,
     this.androidAttachSurfaceAfterVideoParameters,
     this.outputMode = VideoOutputMode.texture,
+    this.pixelFormat16F = false,
   });
 
   /// Returns a copy of this class with the given fields replaced by the new values.
@@ -193,6 +205,7 @@ class VideoControllerConfiguration {
     bool? enableHardwareAcceleration,
     bool? androidAttachSurfaceAfterVideoParameters,
     VideoOutputMode? outputMode,
+    bool? pixelFormat16F,
   }) =>
       VideoControllerConfiguration(
         vo: vo ?? this.vo,
@@ -206,5 +219,6 @@ class VideoControllerConfiguration {
             androidAttachSurfaceAfterVideoParameters ??
                 this.androidAttachSurfaceAfterVideoParameters,
         outputMode: outputMode ?? this.outputMode,
+        pixelFormat16F: pixelFormat16F ?? this.pixelFormat16F,
       );
 }

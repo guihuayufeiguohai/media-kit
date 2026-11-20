@@ -22,6 +22,19 @@ NS_ASSUME_NONNULL_BEGIN
 /// Returns nil when Vulkan is unavailable (no Metal device, MoltenVK init
 /// failure, mpv built without the Vulkan render API, ...). `error` then
 /// carries a human readable reason.
+///
+/// `halfFloat` selects the intermediate format:
+///   * NO  -> B8G8R8A8_UNORM / kCVPixelFormatType_32BGRA, the only thing
+///            Flutter's external texture path accepts.
+///   * YES -> R16G16B16A16_SFLOAT / kCVPixelFormatType_64RGBAHalf, for the
+///            CAMetalLayer sink.
+- (nullable instancetype)initWithMpvHandle:(void *)handle
+                                     width:(int)width
+                                    height:(int)height
+                                 halfFloat:(BOOL)halfFloat
+                                     error:(NSString *_Nullable *_Nullable)error;
+
+/// Convenience for the 8-bit BGRA path.
 - (nullable instancetype)initWithMpvHandle:(void *)handle
                                      width:(int)width
                                     height:(int)height

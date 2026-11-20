@@ -198,6 +198,7 @@ class NativeVideoController extends PlatformVideoController {
           'enableHardwareAcceleration':
               configuration.enableHardwareAcceleration,
           'outputMode': configuration.outputMode.wire,
+          'pixelFormat16F': configuration.pixelFormat16F,
         },
       },
     );

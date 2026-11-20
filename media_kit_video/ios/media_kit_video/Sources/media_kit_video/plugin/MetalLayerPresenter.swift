@@ -25,6 +25,8 @@ import UIKit
     private let cache: CVMetalTextureCache
     private let sampler: MTLSamplerState
     private let pipeline: MTLRenderPipelineState
+    /// Must match what MKVulkanRenderer produces: 32BGRA or 64RGBAHalf.
+    private let sourceFormat: MTLPixelFormat
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -56,6 +58,7 @@ import UIKit
 
     init?(
       renderer: ResizableTextureProtocol,
+      pixelFormat16F: Bool,
       onResize: @escaping VideoOutput.TextureUpdateCallback
     ) {
       guard let device = MTLCreateSystemDefaultDevice(),
@@ -109,6 +112,7 @@ import UIKit
       self.cache = cache
       self.sampler = sampler
       self.pipeline = pipeline
+      self.sourceFormat = pixelFormat16F ? .rgba16Float : .bgra8Unorm
 
       super.init()
 
@@ -125,7 +129,9 @@ import UIKit
         object: nil
       )
 
-      NSLog("MetalLayer: init device=\(device.name) src=bgra8")
+      NSLog(
+        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8")"
+      )
     }
 
     // MARK: - VideoFramePresenter
@@ -227,7 +233,7 @@ import UIKit
       let height = CVPixelBufferGetHeight(pixelBuffer)
       var cvTexture: CVMetalTexture?
       let status = CVMetalTextureCacheCreateTextureFromImage(
-        kCFAllocatorDefault, cache, pixelBuffer, nil, .bgra8Unorm,
+        kCFAllocatorDefault, cache, pixelBuffer, nil, sourceFormat,
         width, height, 0, &cvTexture)
       guard status == kCVReturnSuccess, let cvTexture = cvTexture,
         let source = CVMetalTextureGetTexture(cvTexture)
@@ -307,7 +313,9 @@ import UIKit
       presented += 1
       if !firstPresentLogged {
         firstPresentLogged = true
-        NSLog("MetalLayer: first present src=bgra8")
+        NSLog(
+          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8")"
+        )
       }
       let now = CACurrentMediaTime()
       if now - lastStats >= 5.0 {
@@ -316,6 +324,18 @@ import UIKit
         )
         lastStats = now
       }
+    }
+
+    /// Cheap precondition check so `VideoOutput` can pick the intermediate pixel
+    /// format *before* building the renderer.
+    ///
+    /// A 16F ring is only safe when the layer sink can actually be created:
+    /// Flutter's external texture path rejects anything but BGRA8, so a failed
+    /// presenter would otherwise leave the texture fallback holding a buffer the
+    /// engine refuses.
+    static var isSupported: Bool {
+      guard let device = MTLCreateSystemDefaultDevice() else { return false }
+      return shaderLibrary(device) != nil
     }
 
     /// Compiled once per process. Doing this lazily inside present() would stall

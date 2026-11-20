@@ -151,9 +151,11 @@ public class VideoOutput: NSObject {
   private let registry: FlutterTextureRegistry
   private let textureUpdateCallback: TextureUpdateCallback
   private let worker: Worker = .init()
-  // C1 plumbs this all the way from Dart but only ever honours `.texture`.
-  // C2 introduces MetalLayerPresenter and the branch that selects it.
+  /// Which sink Dart asked for. Native is the final arbiter: iOS 15, a missing
+  /// Vulkan renderer or an unsupported Metal device all fall back to texture.
   private let requestedMode: VideoOutputMode
+  /// 16F intermediate instead of 8-bit BGRA. Layer sink only.
+  private let requestedPixelFormat16F: Bool
   private var width: Int64?
   private var height: Int64?
   private var texture: ResizableTextureProtocol!
@@ -184,6 +186,7 @@ public class VideoOutput: NSObject {
     height = configuration.height
     enableHardwareAcceleration = configuration.enableHardwareAcceleration
     requestedMode = configuration.outputMode
+    requestedPixelFormat16F = configuration.pixelFormat16F
     self.registry = registry
     self.textureUpdateCallback = textureUpdateCallback
 
@@ -223,6 +226,17 @@ public class VideoOutput: NSObject {
     }
 
     #if os(iOS)
+      // Decide the sink *before* building the renderer: the intermediate pixel
+      // format is baked into the IOSurface ring, and only the layer sink can
+      // take 16F (Flutter's external texture path rejects anything but BGRA8).
+      var wantsLayer = false
+      if #available(iOS 16.0, *), requestedMode == .metalLayer,
+        MetalLayerPresenter.isSupported
+      {
+        wantsLayer = true
+      }
+      let halfFloat = wantsLayer && requestedPixelFormat16F
+
       // Kept out here so the sink selection below can tell "Vulkan is
       // available" apart from "we fell back to TextureSW".
       var vkTexture: TextureVK?
@@ -240,6 +254,7 @@ public class VideoOutput: NSObject {
       #if os(iOS)
         if let vulkanTexture = TextureVK(
           handle: handle,
+          halfFloat: halfFloat,
           // Use `weak self` to prevent memory leaks
           updateCallback: { [weak self]() in
             guard let that = self else {
@@ -309,9 +324,10 @@ public class VideoOutput: NSObject {
     // ---- choose the sink ---------------------------------------------------
     var layerPresenter: VideoFramePresenter?
     #if os(iOS)
-      if #available(iOS 16.0, *), requestedMode == .metalLayer, vkTexture != nil {
+      if wantsLayer, vkTexture != nil {
         layerPresenter = MetalLayerPresenter(
           renderer: texture,
+          pixelFormat16F: halfFloat,
           onResize: textureUpdateCallback
         )
         if layerPresenter == nil {

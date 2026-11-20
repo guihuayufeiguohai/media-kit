@@ -31,6 +31,7 @@ public class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   init?(
     handle: OpaquePointer,
+    halfFloat: Bool = false,
     updateCallback: @escaping UpdateCallback
   ) {
     var error: NSString?
@@ -39,6 +40,7 @@ public class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol {
         mpvHandle: UnsafeMutableRawPointer(handle),
         width: 0,
         height: 0,
+        halfFloat: halfFloat,
         error: &error
       )
     else {
