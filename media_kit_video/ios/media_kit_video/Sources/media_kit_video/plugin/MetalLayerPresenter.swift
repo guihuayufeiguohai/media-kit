@@ -40,8 +40,9 @@ import UIKit
     /// mpv handle, used to ask which transfer function the frames in the ring
     /// are actually in. See `syncLayerToMPV`.
     private let mpvHandle: OpaquePointer?
-    /// Last transfer mpv reported. nil until it answers.
-    private var mpvHDR: Bool? = nil
+    /// Last transfer mpv reported (`video-out-params/gamma`). nil until it
+    /// answers, which is different from "answered SDR".
+    private var mpvGamma: String? = nil
     /// What the layer is configured for right now. Diagnostics only; the draw
     /// path reads the drawable instead.
     private var appliedHDR: Bool? = nil
@@ -208,10 +209,7 @@ import UIKit
       }
       // The view is a fresh layer every time (route push/pop, Hero), so this
       // has to configure unconditionally rather than trust `appliedHDR`.
-      applyDrawable(
-        hdr: edrCapable && (mpvHDR ?? false),
-        reason: "attach"
-      )
+      applyDrawable(gamma: mpvGamma, reason: "attach")
       NSLog(
         "MetalLayer: attached \(view.bounds.size) drawable=\(appliedHDR == true ? "rgba16f/pq" : "bgra8/srgb") edrCapable=\(edrCapable ? 1 : 0)"
       )
@@ -227,11 +225,14 @@ import UIKit
     /// was verified against the baseline.
     ///
     /// Main thread only.
-    private func applyDrawable(hdr: Bool, reason: String) {
+    private func applyDrawable(gamma: String?, reason: String) {
       stateLock.lock()
       let view = self.view
       stateLock.unlock()
 
+      // `edrCapable` still gates the decision: without a PQ colorspace there is
+      // nowhere to put an HDR transfer, and `syncLayerToMPV` never reports one.
+      let hdr = edrCapable && MetalLayerPresenter.isHDR(gamma)
       appliedHDR = hdr
       guard let layer = view?.layer as? CAMetalLayer else { return }
 
@@ -241,13 +242,25 @@ import UIKit
       if layer.pixelFormat != format {
         layer.pixelFormat = format
       }
-      layer.colorspace = hdr ? pqColorspace : srgbColorspace
+      if hdr {
+        // HLG is not PQ -- same 16F + EDR treatment, different transfer curve.
+        layer.colorspace =
+          gamma == "hlg"
+          ? (CGColorSpace(name: CGColorSpace.itur_2100_HLG) ?? pqColorspace)
+          : pqColorspace
+      } else {
+        layer.colorspace = srgbColorspace
+      }
       if #available(iOS 16.0, *) {
         layer.wantsExtendedDynamicRangeContent = hdr
       }
       NSLog(
-        "MetalLayer: drawable \(hdr ? "rgba16f/pq edr=1" : "bgra8/srgb edr=0") (\(reason))"
+        "MetalLayer: drawable \(hdr ? "rgba16f/\(gamma ?? "?") edr=1" : "bgra8/srgb edr=0") (\(reason))"
       )
+    }
+
+    private static func isHDR(_ gamma: String?) -> Bool {
+      gamma == "pq" || gamma == "hlg"
     }
 
     /// Asks mpv which transfer function the frames in the ring are in.
@@ -276,11 +289,10 @@ import UIKit
           "video-out-params/gamma"
         )
       else { return }
-      let hdr = (gamma == "pq" || gamma == "hlg")
-      if mpvHDR == hdr { return }
-      mpvHDR = hdr
+      if mpvGamma == gamma { return }
+      mpvGamma = gamma
       DispatchQueue.main.async { [weak self] in
-        self?.applyDrawable(hdr: hdr, reason: "video-out-params/gamma=\(gamma)")
+        self?.applyDrawable(gamma: gamma, reason: "video-out-params/gamma=\(gamma)")
       }
     }
 
