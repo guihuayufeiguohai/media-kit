@@ -561,10 +561,13 @@ static void OnMpvRenderUpdate(void *ctx) {
   }
 }
 
-// One-shot dump of what mpv decided to do with the source colours. This is
-// the only way to tell "DV tone mapping happened" from "it just looks okay":
-// an 8-bit BGRA target cannot carry PQ, so video-out-params must show a
-// tone-mapped SDR result, not pq/bt.2020 passed through.
+// One-shot dump of what mpv decided to do with the source colours.
+//
+// `video-target-params` is deliberately absent: mpv 0.41.0 (libmpv) does not
+// export it -- mpv_get_property_string() returns NULL, which is why C4.2's
+// "follow the VO's target" logic silently read "not HDR" for every clip and
+// left SDR *and* DV P5 tagged as sRGB. `video-out-params` is the property that
+// actually answers, so that is what the layer sink reads.
 - (void)logColorPipeline {
   static const char *keys[] = {
       "video-params/primaries",
@@ -576,11 +579,7 @@ static void OnMpvRenderUpdate(void *ctx) {
       "video-out-params/gamma",
       "video-out-params/sig-peak",
       "video-out-params/pixelformat",
-      // The VO's own answer for what it will output. Unlike video-out-params
-      // this is post-conversion, so it is what the layer must be tagged with.
-      "video-target-params/primaries",
-      "video-target-params/gamma",
-      "video-target-params/sig-peak",
+      "video-out-params/colormatrix",
       "tone-mapping",
       "tone-mapping-mode",
       "hdr-compute-peak",

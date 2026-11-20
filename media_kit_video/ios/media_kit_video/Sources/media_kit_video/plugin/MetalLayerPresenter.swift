@@ -27,22 +27,29 @@ import UIKit
     private let pipeline: MTLRenderPipelineState
     /// Must match what MKVulkanRenderer produces: 32BGRA or 64RGBAHalf.
     private let sourceFormat: MTLPixelFormat
-    /// What the drawable is set to. `.rgba16Float` only when EDR is actually
-    /// active -- see `init`.
-    private let drawableFormat: MTLPixelFormat
-    /// PQ (`ITU-R BT.2100`) when EDR is active, nil otherwise.
-    private let drawableColorspace: CGColorSpace?
+    /// PQ (`ITU-R BT.2100`). Present only when EDR was requested *and*
+    /// CoreGraphics knows the space -- permission to go HDR, not a decision.
+    private let pqColorspace: CGColorSpace?
+    private let srgbColorspace: CGColorSpace?
     /// True when EDR was requested *and* CoreGraphics has a PQ colorspace.
-    /// This is only permission to go HDR, not a decision: `edrActive` is what
-    /// the layer is actually doing right now.
     private let edrCapable: Bool
-    /// Whether the layer is currently tagged PQ + EDR.
-    private var edrActive = false
-    /// mpv handle, used to ask what transfer function the VO is really
-    /// producing. See `resolveTargetTransfer`.
+    /// One pipeline per drawable format. The pipeline is chosen from the
+    /// drawable we just got (`drawable.texture.pixelFormat`), never from shared
+    /// state, so a format change on the main thread cannot race a draw.
+    private let pipeline8: MTLRenderPipelineState
+    private let pipeline16F: MTLRenderPipelineState
+    /// mpv handle, used to ask which transfer function the frames in the ring
+    /// are actually in. See `syncLayerToMPV`.
     private let mpvHandle: OpaquePointer?
-    /// nil until mpv reports a target transfer.
-    private var targetHDR: Bool? = nil
+    /// Last transfer mpv reported. nil until it answers.
+    private var mpvHDR: Bool? = nil
+    /// What the layer is configured for right now. Diagnostics only; the draw
+    /// path reads the drawable instead.
+    private var appliedHDR: Bool? = nil
+    /// Frames since the last reconfig; sets the property poll rate. Written by
+    /// `resized` on Worker and bumped by `draw` on `presentQueue` -- a lost
+    /// update only costs a slower re-tag, so it stays unsynchronised.
+    private var framesSinceResize = 0
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -111,9 +118,6 @@ import UIKit
       }
 
       // EDR is only worth it if CoreGraphics can hand us a PQ colorspace.
-      // Without it the drawable would be tagged sRGB, the PQ code values would
-      // be read as sRGB and the picture would come out dark and desaturated --
-      // worse than plain SDR, not better.
       var pqColorspace: CGColorSpace? = nil
       if outputEDR {
         pqColorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
@@ -122,20 +126,22 @@ import UIKit
         }
       }
       let edrCapable = pqColorspace != nil
-      // Float for the whole life of the layer. mpv can move from an SDR file to
-      // an HDR one without tearing the layer down, and swapping pixelFormat
-      // mid-playback discards drawables and needs a new pipeline.
-      let drawableFormat: MTLPixelFormat = edrCapable ? .rgba16Float : .bgra8Unorm
 
-      let descriptor = MTLRenderPipelineDescriptor()
-      descriptor.vertexFunction = vertexFn
-      descriptor.fragmentFunction = fragmentFn
-      // Must match the layer's pixel format, which `attach` sets from
-      // `drawableFormat`. NOT `.bgra8Unorm_srgb`: the shader writes
-      // already-encoded values, and an sRGB attachment would encode them a
-      // second time.
-      descriptor.colorAttachments[0].pixelFormat = drawableFormat
-      guard let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
+      // Both pipelines up front: the drawable format follows the source and can
+      // flip mid-playback (SDR clip -> HDR clip without a teardown), so
+      // building one on demand would stall a frame inside the render loop.
+      //
+      // NOT `_srgb`: the shader writes already-encoded values, and an sRGB
+      // attachment would encode them a second time.
+      func makePipeline(_ format: MTLPixelFormat) -> MTLRenderPipelineState? {
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = vertexFn
+        descriptor.fragmentFunction = fragmentFn
+        descriptor.colorAttachments[0].pixelFormat = format
+        return try? device.makeRenderPipelineState(descriptor: descriptor)
+      }
+      guard let pipeline8 = makePipeline(.bgra8Unorm),
+        let pipeline16F = makePipeline(.rgba16Float)
       else {
         NSLog("MetalLayer: makeRenderPipelineState failed")
         return nil
@@ -147,10 +153,11 @@ import UIKit
       self.queue = queue
       self.cache = cache
       self.sampler = sampler
-      self.pipeline = pipeline
+      self.pipeline8 = pipeline8
+      self.pipeline16F = pipeline16F
       self.sourceFormat = pixelFormat16F ? .rgba16Float : .bgra8Unorm
-      self.drawableFormat = drawableFormat
-      self.drawableColorspace = pqColorspace
+      self.pqColorspace = pqColorspace
+      self.srgbColorspace = CGColorSpace(name: CGColorSpace.sRGB)
       self.edrCapable = edrCapable
       self.mpvHandle = mpvHandle
 
@@ -170,7 +177,7 @@ import UIKit
       )
 
       NSLog(
-        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edrCapable=\(edrCapable ? 1 : 0)"
+        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8") edrCapable=\(edrCapable ? 1 : 0) drawable=pending"
       )
     }
 
@@ -185,9 +192,9 @@ import UIKit
     }
 
     func resized(_ size: CGSize) {
-      // New content may mean a different transfer function (SDR file -> HDR
-      // file). Drop the cached answer so the next frame re-reads it.
-      targetHDR = nil
+      // New content may mean a different transfer function. Restart the fast
+      // poll so `syncLayerToMPV` re-tags the layer within a frame or two.
+      framesSinceResize = 0
       DispatchQueue.main.sync {
         self.onResize(-1, size, .metalLayer)
       }
@@ -197,73 +204,85 @@ import UIKit
       stateLock.lock()
       self.view = view
       stateLock.unlock()
-      if let view = view {
-        configureLayer(of: view)
-        applyTargetTransfer()
-        NSLog(
-          "MetalLayer: attached \(view.bounds.size) dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edrCapable=\(edrCapable ? 1 : 0) edr=\(edrActive ? 1 : 0)"
-        )
-      } else {
+      guard let view = view else {
         NSLog("MetalLayer: detached")
+        return
       }
+      // The view is a fresh layer every time (route push/pop, Hero), so this
+      // has to configure unconditionally rather than trust `appliedHDR`.
+      applyDrawable(
+        hdr: edrCapable && (mpvHDR ?? false),
+        reason: "attach"
+      )
+      NSLog(
+        "MetalLayer: attached \(view.bounds.size) drawable=\(appliedHDR == true ? "rgba16f/pq" : "bgra8/srgb") edrCapable=\(edrCapable ? 1 : 0)"
+      )
     }
 
-    /// Called on the main thread, before the first drawable is requested.
+    /// Points the layer at the transfer function mpv is really producing.
     ///
-    /// The drawable format and colorspace live on the layer, not here, and
-    /// `MKVideoLayerView` cannot know them: it is created by Flutter's platform
-    /// view factory, which only receives the mpv handle. The presenter is the
-    /// only object that knows both the requested configuration and whether EDR
-    /// actually came up, so it takes over.
-    private func configureLayer(of view: UIView) {
-      guard let layer = view.layer as? CAMetalLayer else { return }
-      // Guarded: assigning `pixelFormat` discards existing drawables, and a
-      // re-attach (route push/pop, Hero) must not throw away a frame.
-      if layer.pixelFormat != drawableFormat {
-        layer.pixelFormat = drawableFormat
-      }
-    }
-
-    /// Tag the layer with whatever mpv is *actually* producing.
+    /// The drawable format is part of the tag, not just the colorspace: a
+    /// 16F drawable tagged sRGB is *not* a pass-through on iOS -- CoreAnimation
+    /// reads float content as linear and re-encodes it for the display, which
+    /// lifts every midtone. That is the "washed out, no white veil" SDR picture
+    /// from C4.2. The 8-bit drawable below is bit-for-bit the C3 path, which
+    /// was verified against the baseline.
     ///
-    /// Guessing PQ here is what broke SDR playback: mpv passes an SDR file
-    /// through as `bt.1886`, and gamma-2.4 code values read through the PQ
-    /// EOTF come out massively lifted -- a white veil over the whole picture.
-    /// `video-target-params` is the VO's own answer (`vo_get_target_params`),
-    /// so it is correct whether or not mpv decided to convert.
-    private func resolveTargetTransfer() {
-      guard edrCapable, targetHDR == nil, let handle = mpvHandle else { return }
-      guard
-        let gamma = MPVHelpers.getStringProperty(
-          handle,
-          "video-target-params/gamma"
-        )
-      else { return }
-      let hdr = (gamma == "pq" || gamma == "hlg")
-      targetHDR = hdr
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self else { return }
-        self.applyTargetTransfer()
-        NSLog("MetalLayer: target gamma=\(gamma) -> \(hdr ? "pq/edr" : "sdr")")
-      }
-    }
-
     /// Main thread only.
-    private func applyTargetTransfer() {
+    private func applyDrawable(hdr: Bool, reason: String) {
       stateLock.lock()
       let view = self.view
       stateLock.unlock()
+
+      appliedHDR = hdr
       guard let layer = view?.layer as? CAMetalLayer else { return }
 
-      let hdr = edrCapable && (targetHDR ?? false)
-      edrActive = hdr
-      if hdr, let colorspace = drawableColorspace {
-        layer.colorspace = colorspace
-      } else {
-        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+      let format: MTLPixelFormat = hdr ? .rgba16Float : .bgra8Unorm
+      // Assigning `pixelFormat` discards the drawables already handed out, so
+      // only touch it when it actually differs.
+      if layer.pixelFormat != format {
+        layer.pixelFormat = format
       }
+      layer.colorspace = hdr ? pqColorspace : srgbColorspace
       if #available(iOS 16.0, *) {
         layer.wantsExtendedDynamicRangeContent = hdr
+      }
+      NSLog(
+        "MetalLayer: drawable \(hdr ? "rgba16f/pq edr=1" : "bgra8/srgb edr=0") (\(reason))"
+      )
+    }
+
+    /// Asks mpv which transfer function the frames in the ring are in.
+    ///
+    /// `video-target-params` would be the right source (`vo_get_target_params`),
+    /// but this mpv build (0.41.0) does not export it: the property reads back
+    /// NULL, which C4.2 treated as "not HDR" for *every* clip -- SDR and DV P5
+    /// alike -- so the layer was never tagged PQ again.
+    ///
+    /// `video-out-params` is available and, in this pipeline, accurate: the VO
+    /// does not convert (SDR keeps `bt.1886` even with `target-trc=pq` set, DV
+    /// arrives as `pq`), so it is exactly what lands in the IOSurface. If the
+    /// VO ever starts converting, this reading and the picture will disagree --
+    /// the log line below is what tells them apart.
+    ///
+    /// Runs on Worker, before `nextDrawable()`. Fast poll right after a
+    /// reconfig (mpv may still report the previous clip), then one read every
+    /// 30 frames so a same-size content switch still re-tags the layer.
+    private func syncLayerToMPV() {
+      guard edrCapable, let handle = mpvHandle else { return }
+      framesSinceResize += 1
+      if framesSinceResize >= 90 && framesSinceResize % 30 != 0 { return }
+      guard
+        let gamma = MPVHelpers.getStringProperty(
+          handle,
+          "video-out-params/gamma"
+        )
+      else { return }
+      let hdr = (gamma == "pq" || gamma == "hlg")
+      if mpvHDR == hdr { return }
+      mpvHDR = hdr
+      DispatchQueue.main.async { [weak self] in
+        self?.applyDrawable(hdr: hdr, reason: "video-out-params/gamma=\(gamma)")
       }
     }
 
@@ -329,14 +348,28 @@ import UIKit
         return
       }
 
-      // Cheap after the first frame (early-returns once targetHDR is known).
-      // Must happen before nextDrawable so the layer is tagged correctly for
-      // the frame we are about to present.
-      resolveTargetTransfer()
+      // Cheap after the first frames (a couple of property reads, then one per
+      // 30 frames). Must happen before nextDrawable so the layer is tagged
+      // correctly for the frame we are about to present.
+      syncLayerToMPV()
 
       guard let drawable = layer.nextDrawable() else {
         inflight.signal()
         skippedNil += 1
+        return
+      }
+
+      // Picked from the drawable, not from `appliedHDR`: the format can change
+      // on the main thread between nextDrawable() and here.
+      let pipeline: MTLRenderPipelineState
+      switch drawable.texture.pixelFormat {
+      case .rgba16Float: pipeline = pipeline16F
+      case .bgra8Unorm: pipeline = pipeline8
+      default:
+        inflight.signal()
+        NSLog(
+          "MetalLayer: unexpected drawable format \(drawable.texture.pixelFormat.rawValue)"
+        )
         return
       }
 
@@ -425,7 +458,7 @@ import UIKit
       if !firstPresentLogged {
         firstPresentLogged = true
         NSLog(
-          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(edrActive ? 1 : 0)"
+          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(appliedHDR == true ? "rgba16f/pq" : "bgra8/srgb")"
         )
       }
       let now = CACurrentMediaTime()
