@@ -8,6 +8,7 @@ import 'dart:async';
 import 'package:flutter/widgets.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video_controls/media_kit_video_controls.dart';
 
 import 'package:media_kit_video/src/subtitle/subtitle_view.dart';
@@ -290,6 +291,14 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
           widget.controller.player.pause();
         }
       } else {
+        if (state == AppLifecycleState.resumed &&
+            _pauseDueToPauseUponEnteringBackgroundMode) {
+          // iOS tore the VideoToolbox session down while we were backgrounded.
+          // Rebuild the decoder before the user resumes, otherwise mpv finds
+          // out on the first frame, gives up on hardware and spends the rest of
+          // the session in software.
+          _recoverHardwareDecoder();
+        }
         if (widget.resumeUponEnteringForegroundMode &&
             _pauseDueToPauseUponEnteringBackgroundMode) {
           _pauseDueToPauseUponEnteringBackgroundMode = false;
@@ -298,6 +307,47 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
       }
     }
     super.didChangeAppLifecycleState(state);
+  }
+
+  bool _recoveringHardwareDecoder = false;
+
+  /// iOS invalidates the VideoToolbox session when the app goes to the
+  /// background. mpv only finds out on the first decode after returning
+  /// (`hevc: Failed to decode frame (invalid session, -12903)`), then gives up
+  /// on the hardware decoder and spends the rest of the session in software --
+  /// 4K HEVC then plays at a few frames per second. That is the "stutter after
+  /// coming back from the background" symptom.
+  ///
+  /// mpv only rebuilds the decoder when an option carrying UPDATE_HWDEC
+  /// actually changes (player/command.c), and vd_lavc's reinit() clears the
+  /// attempted-hwdec list, so the hardware decoder is retried from scratch.
+  /// Hence the two-step toggle. Each step costs one exact seek to the current
+  /// position, which is still far cheaper than software 4K for the rest of the
+  /// session.
+  Future<void> _recoverHardwareDecoder() async {
+    if (!Platform.isIOS) return;
+    if (_recoveringHardwareDecoder) return;
+    final platform = widget.controller.player.platform;
+    if (platform is! NativePlayer) return;
+    final hwdec = widget.controller.notifier.value?.configuration.hwdec;
+    if (hwdec == null || hwdec == 'no') return;
+    _recoveringHardwareDecoder = true;
+    try {
+      await platform.setProperty(
+        'hwdec',
+        'no',
+        waitForInitialization: false,
+      );
+      await platform.setProperty(
+        'hwdec',
+        hwdec,
+        waitForInitialization: false,
+      );
+    } catch (exception) {
+      debugPrint('media_kit: hardware decoder recovery failed: $exception');
+    } finally {
+      _recoveringHardwareDecoder = false;
+    }
   }
 
   @override
