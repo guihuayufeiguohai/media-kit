@@ -45,9 +45,8 @@ import UIKit
     /// What the layer is configured for right now. Diagnostics only; the draw
     /// path reads the drawable instead.
     private var appliedHDR: Bool? = nil
-    /// Frames since the last reconfig; sets the property poll rate. Written by
-    /// `resized` on Worker and bumped by `draw` on `presentQueue` -- a lost
-    /// update only costs a slower re-tag, so it stays unsynchronised.
+    /// Frames since the last reconfig; sets the property poll rate. Both
+    /// writers (`resized` and `present`) run on Worker.
     private var framesSinceResize = 0
 
     private let stateLock = NSLock()
@@ -264,9 +263,9 @@ import UIKit
     /// VO ever starts converting, this reading and the picture will disagree --
     /// the log line below is what tells them apart.
     ///
-    /// Runs on Worker, before `nextDrawable()`. Fast poll right after a
-    /// reconfig (mpv may still report the previous clip), then one read every
-    /// 30 frames so a same-size content switch still re-tags the layer.
+    /// Runs on Worker, from `present`. Fast poll right after a reconfig (mpv
+    /// may still report the previous clip), then one read every 30 frames so a
+    /// same-size content switch still re-tags the layer.
     private func syncLayerToMPV() {
       guard edrCapable, let handle = mpvHandle else { return }
       framesSinceResize += 1
@@ -295,6 +294,12 @@ import UIKit
         skippedNoView += 1
         return
       }
+
+      // Cheap after the first frames (a couple of property reads, then one per
+      // 30 frames). Kept on Worker, next to `resized()`, so every mpv client
+      // API call this class makes stays on one thread and the frame counter
+      // needs no synchronisation.
+      syncLayerToMPV()
 
       guard let pixelBuffer = renderer.copyPixelBuffer()?.takeRetainedValue()
       else {
@@ -347,11 +352,8 @@ import UIKit
         return
       }
 
-      // Cheap after the first frames (a couple of property reads, then one per
-      // 30 frames). Must happen before nextDrawable so the layer is tagged
-      // correctly for the frame we are about to present.
-      syncLayerToMPV()
-
+      // No mpv calls here: the layer was already tagged by `present` on Worker,
+      // and everything below runs on `presentQueue`.
       guard let drawable = layer.nextDrawable() else {
         inflight.signal()
         skippedNil += 1
