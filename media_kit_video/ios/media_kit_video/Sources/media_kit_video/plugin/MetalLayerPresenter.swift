@@ -37,12 +37,20 @@ import UIKit
     // of the in-flight set.
     private let inflight = DispatchSemaphore(value: 2)
 
+    // Drawing happens here, never on Worker: CAMetalLayer can withhold a
+    // drawable for a long time and the render loop must not wait for it.
+    private let presentQueue = DispatchQueue(
+      label: "media_kit_video.metal.present",
+      qos: .userInteractive
+    )
+
     // Diagnostics only; deliberately unsynchronised. Losing a count here is
     // preferable to taking a lock in the per-frame path.
     private var presented = 0
     private var skippedNil = 0
     private var skippedBusy = 0
     private var skippedNoView = 0
+    private var maxDrawMs: Double = 0
     private var firstPresentLogged = false
     private var lastStats = CACurrentMediaTime()
 
@@ -153,9 +161,7 @@ import UIKit
       let target = view
       stateLock.unlock()
 
-      guard !dead, let target = target, target.bounds.width >= 1,
-        let layer = target.layer as? CAMetalLayer
-      else {
+      guard !dead, let target = target, target.bounds.width >= 1 else {
         skippedNoView += 1
         return
       }
@@ -165,10 +171,49 @@ import UIKit
         return
       }
 
-      // Never block Worker: nextDrawable() alone can stall for a second, and
-      // mpv's watchdog only cares whether render() keeps being called.
+      // Back-pressure *before* queueing, so at most `inflight` frames are
+      // pending and the ring slot behind `pixelBuffer` cannot be recycled while
+      // we still hold it.
       guard inflight.wait(timeout: .now()) == .success else {
         skippedBusy += 1
+        return
+      }
+
+      // Hand the frame off instead of drawing here.
+      //
+      // Everything from nextDrawable() onwards can block for hundreds of
+      // milliseconds: the display link is idle while the app is paused, the
+      // screen is off, or the GPU is behind, and CAMetalLayer will not hand out
+      // a drawable until one comes back. Blocking Worker delays the next
+      // mpv_render_context_render(), which trips mpv's watchdog -- it then logs
+      // "render() not being called or stuck", tears the video chain down
+      // (EOF -> new Decoder format -> playback restart) and the user waits
+      // 1-2.7s for the next frame. That is the "stutter after pause" symptom.
+      let semaphore = inflight
+      presentQueue.async { [weak self, weak target] in
+        guard let self = self, let target = target else {
+          semaphore.signal()
+          return
+        }
+        self.draw(pixelBuffer: pixelBuffer, target: target)
+      }
+    }
+
+    /// Runs on `presentQueue`, never on Worker.
+    private func draw(pixelBuffer: CVPixelBuffer, target: UIView) {
+      let started = CACurrentMediaTime()
+      defer {
+        let ms = (CACurrentMediaTime() - started) * 1000
+        if ms > maxDrawMs { maxDrawMs = ms }
+        if ms > 50 {
+          NSLog(
+            "MetalLayer: draw took \(Int(ms))ms (nextDrawable or GPU backpressure)"
+          )
+        }
+      }
+
+      guard !closed, let layer = target.layer as? CAMetalLayer else {
+        inflight.signal()
         return
       }
 
@@ -267,7 +312,7 @@ import UIKit
       let now = CACurrentMediaTime()
       if now - lastStats >= 5.0 {
         NSLog(
-          "MetalLayer: stats presented=\(presented) nil=\(skippedNil) busy=\(skippedBusy) noview=\(skippedNoView)"
+          "MetalLayer: stats presented=\(presented) nil=\(skippedNil) busy=\(skippedBusy) noview=\(skippedNoView) drawMax=\(Int(maxDrawMs))ms"
         )
         lastStats = now
       }
