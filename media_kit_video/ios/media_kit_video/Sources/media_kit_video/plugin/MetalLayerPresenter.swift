@@ -24,7 +24,6 @@ import UIKit
     private let queue: MTLCommandQueue
     private let cache: CVMetalTextureCache
     private let sampler: MTLSamplerState
-    private let pipeline: MTLRenderPipelineState
     /// Must match what MKVulkanRenderer produces: 32BGRA or 64RGBAHalf.
     private let sourceFormat: MTLPixelFormat
     /// PQ (`ITU-R BT.2100`). Present only when EDR was requested *and*
