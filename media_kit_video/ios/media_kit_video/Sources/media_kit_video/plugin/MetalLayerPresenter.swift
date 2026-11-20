@@ -51,6 +51,9 @@ import UIKit
     private var framesSinceResize = 0
     /// One pixel-value probe per clip. See `probeFrameRange`.
     private var probePending = true
+    /// Second probe once playback has settled. The first frame of a clip is
+    /// often black or a fade-in, which says nothing about the mapping.
+    private var steadyProbePending = true
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -205,6 +208,7 @@ import UIKit
       // poll so `syncLayerToMPV` re-tags the layer within a frame or two.
       framesSinceResize = 0
       probePending = true
+      steadyProbePending = true
       DispatchQueue.main.sync {
         self.onResize(-1, size, .metalLayer)
       }
@@ -295,7 +299,7 @@ import UIKit
     /// free to convert to the target. A bright SDR frame reads `max≈1.000` when
     /// the ring is coded (bt.1886 / sRGB / rescaled linear), and `max≈0.51`
     /// when it is PQ -- PQ places SDR white at 100 nits, code 0.508.
-    private func probeFrameRange(_ pixelBuffer: CVPixelBuffer) {
+    private func probeFrameRange(_ pixelBuffer: CVPixelBuffer, label: String) {
       // The pod targets iOS 9; `Float16` needs 14. The layer sink itself is
       // iOS 16+, so this only ever returns early on builds that never run it.
       guard #available(iOS 14.0, *) else { return }
@@ -342,7 +346,7 @@ import UIKit
       }
       let mean = count > 0 ? sum / Float(count) : 0
       NSLog(
-        "MetalLayer: probe max=\(String(format: "%.3f", maximum)) mean=\(String(format: "%.3f", mean)) samples=\(count) tagged=\(appliedHDR == true ? "pq" : "srgb")"
+        "MetalLayer: probe \(label) max=\(String(format: "%.3f", maximum)) mean=\(String(format: "%.3f", mean)) samples=\(count) tagged=\(appliedHDR == true ? "pq" : "srgb")"
       )
     }
 
@@ -510,12 +514,15 @@ import UIKit
 
       // Numbers beat reasoning here: `video-out-params` is the vf chain's
       // output, NOT what the GPU wrote into the ring, so it cannot tell us
-      // whether mpv converted to PQ in the shader. A bright frame has max=1.0
-      // if the ring is coded (bt.1886/sRGB/linear-scaled), and ≈0.51 if it is
-      // PQ (SDR white = 100 nits = PQ 0.508).
+      // whether mpv converted. A bright frame has max=1.0 if the ring is coded
+      // (bt.1886/sRGB/linear-scaled), and ≈0.51 if it is PQ (SDR white = 100
+      // nits = PQ 0.508).
       if probePending {
         probePending = false
-        probeFrameRange(pixelBuffer)
+        probeFrameRange(pixelBuffer, label: "first")
+      } else if steadyProbePending, framesSinceResize >= 30 {
+        steadyProbePending = false
+        probeFrameRange(pixelBuffer, label: "steady")
       }
 
       // Picked from the drawable, not from `appliedHDR`: the format can change
