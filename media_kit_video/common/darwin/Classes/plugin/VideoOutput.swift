@@ -335,6 +335,7 @@ public class VideoOutput: NSObject {
           renderer: texture,
           pixelFormat16F: halfFloat,
           outputEDR: requestedEDR,
+          mpvHandle: handle,
           onResize: textureUpdateCallback
         )
         if layerPresenter == nil {

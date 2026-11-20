@@ -13,6 +13,20 @@ public enum MPVHelpers {
     }
   }
 
+  /// Reads a string property, returning nil if mpv does not have one yet.
+  ///
+  /// Used by the layer sink to find out what transfer function the VO is
+  /// really producing before tagging the CAMetalLayer.
+  public static func getStringProperty(
+    _ handle: OpaquePointer,
+    _ name: String
+  ) -> String? {
+    guard let raw = mpv_get_property_string(handle, name) else { return nil }
+    defer { mpv_free(raw) }
+    let value = String(cString: raw)
+    return value.isEmpty ? nil : value
+  }
+
   public static func getVideoOutParams(
     _ handle: OpaquePointer
   ) -> MPVVideoOutParams {

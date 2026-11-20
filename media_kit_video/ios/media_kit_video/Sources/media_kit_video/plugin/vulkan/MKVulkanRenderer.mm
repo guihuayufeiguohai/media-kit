@@ -576,6 +576,11 @@ static void OnMpvRenderUpdate(void *ctx) {
       "video-out-params/gamma",
       "video-out-params/sig-peak",
       "video-out-params/pixelformat",
+      // The VO's own answer for what it will output. Unlike video-out-params
+      // this is post-conversion, so it is what the layer must be tagged with.
+      "video-target-params/primaries",
+      "video-target-params/gamma",
+      "video-target-params/sig-peak",
       "tone-mapping",
       "tone-mapping-mode",
       "hdr-compute-peak",

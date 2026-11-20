@@ -32,9 +32,17 @@ import UIKit
     private let drawableFormat: MTLPixelFormat
     /// PQ (`ITU-R BT.2100`) when EDR is active, nil otherwise.
     private let drawableColorspace: CGColorSpace?
-    /// False if EDR was requested but CoreGraphics had no PQ colorspace: the
-    /// layer then stays SDR and the 16F drawable would only waste bandwidth.
-    private let outputEDR: Bool
+    /// True when EDR was requested *and* CoreGraphics has a PQ colorspace.
+    /// This is only permission to go HDR, not a decision: `edrActive` is what
+    /// the layer is actually doing right now.
+    private let edrCapable: Bool
+    /// Whether the layer is currently tagged PQ + EDR.
+    private var edrActive = false
+    /// mpv handle, used to ask what transfer function the VO is really
+    /// producing. See `resolveTargetTransfer`.
+    private let mpvHandle: OpaquePointer?
+    /// nil until mpv reports a target transfer.
+    private var targetHDR: Bool? = nil
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -68,6 +76,7 @@ import UIKit
       renderer: ResizableTextureProtocol,
       pixelFormat16F: Bool,
       outputEDR: Bool = false,
+      mpvHandle: OpaquePointer? = nil,
       onResize: @escaping VideoOutput.TextureUpdateCallback
     ) {
       guard let device = MTLCreateSystemDefaultDevice(),
@@ -112,11 +121,11 @@ import UIKit
           NSLog("MetalLayer: PQ colorspace unavailable, staying SDR")
         }
       }
-      let edr = pqColorspace != nil
-      // 16F for EDR: a 10-bit drawable would work too, but the source is
-      // already 16F and staying float keeps the whole path unquantised until
-      // the compositor.
-      let drawableFormat: MTLPixelFormat = edr ? .rgba16Float : .bgra8Unorm
+      let edrCapable = pqColorspace != nil
+      // Float for the whole life of the layer. mpv can move from an SDR file to
+      // an HDR one without tearing the layer down, and swapping pixelFormat
+      // mid-playback discards drawables and needs a new pipeline.
+      let drawableFormat: MTLPixelFormat = edrCapable ? .rgba16Float : .bgra8Unorm
 
       let descriptor = MTLRenderPipelineDescriptor()
       descriptor.vertexFunction = vertexFn
@@ -142,7 +151,8 @@ import UIKit
       self.sourceFormat = pixelFormat16F ? .rgba16Float : .bgra8Unorm
       self.drawableFormat = drawableFormat
       self.drawableColorspace = pqColorspace
-      self.outputEDR = edr
+      self.edrCapable = edrCapable
+      self.mpvHandle = mpvHandle
 
       super.init()
 
@@ -160,7 +170,7 @@ import UIKit
       )
 
       NSLog(
-        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(edr ? 1 : 0)"
+        "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edrCapable=\(edrCapable ? 1 : 0)"
       )
     }
 
@@ -175,6 +185,9 @@ import UIKit
     }
 
     func resized(_ size: CGSize) {
+      // New content may mean a different transfer function (SDR file -> HDR
+      // file). Drop the cached answer so the next frame re-reads it.
+      targetHDR = nil
       DispatchQueue.main.sync {
         self.onResize(-1, size, .metalLayer)
       }
@@ -186,8 +199,9 @@ import UIKit
       stateLock.unlock()
       if let view = view {
         configureLayer(of: view)
+        applyTargetTransfer()
         NSLog(
-          "MetalLayer: attached \(view.bounds.size) dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(outputEDR ? 1 : 0)"
+          "MetalLayer: attached \(view.bounds.size) dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edrCapable=\(edrCapable ? 1 : 0) edr=\(edrActive ? 1 : 0)"
         )
       } else {
         NSLog("MetalLayer: detached")
@@ -208,11 +222,48 @@ import UIKit
       if layer.pixelFormat != drawableFormat {
         layer.pixelFormat = drawableFormat
       }
-      if let colorspace = drawableColorspace {
+    }
+
+    /// Tag the layer with whatever mpv is *actually* producing.
+    ///
+    /// Guessing PQ here is what broke SDR playback: mpv passes an SDR file
+    /// through as `bt.1886`, and gamma-2.4 code values read through the PQ
+    /// EOTF come out massively lifted -- a white veil over the whole picture.
+    /// `video-target-params` is the VO's own answer (`vo_get_target_params`),
+    /// so it is correct whether or not mpv decided to convert.
+    private func resolveTargetTransfer() {
+      guard edrCapable, targetHDR == nil, let handle = mpvHandle else { return }
+      guard
+        let gamma = MPVHelpers.getStringProperty(
+          handle,
+          "video-target-params/gamma"
+        )
+      else { return }
+      let hdr = (gamma == "pq" || gamma == "hlg")
+      targetHDR = hdr
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.applyTargetTransfer()
+        NSLog("MetalLayer: target gamma=\(gamma) -> \(hdr ? "pq/edr" : "sdr")")
+      }
+    }
+
+    /// Main thread only.
+    private func applyTargetTransfer() {
+      stateLock.lock()
+      let view = self.view
+      stateLock.unlock()
+      guard let layer = view?.layer as? CAMetalLayer else { return }
+
+      let hdr = edrCapable && (targetHDR ?? false)
+      edrActive = hdr
+      if hdr, let colorspace = drawableColorspace {
         layer.colorspace = colorspace
+      } else {
+        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
       }
       if #available(iOS 16.0, *) {
-        layer.wantsExtendedDynamicRangeContent = outputEDR
+        layer.wantsExtendedDynamicRangeContent = hdr
       }
     }
 
@@ -277,6 +328,11 @@ import UIKit
         inflight.signal()
         return
       }
+
+      // Cheap after the first frame (early-returns once targetHDR is known).
+      // Must happen before nextDrawable so the layer is tagged correctly for
+      // the frame we are about to present.
+      resolveTargetTransfer()
 
       guard let drawable = layer.nextDrawable() else {
         inflight.signal()
@@ -369,7 +425,7 @@ import UIKit
       if !firstPresentLogged {
         firstPresentLogged = true
         NSLog(
-          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(outputEDR ? 1 : 0)"
+          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(drawableFormat == .rgba16Float ? "rgba16f" : "bgra8") edr=\(edrActive ? 1 : 0)"
         )
       }
       let now = CACurrentMediaTime()
