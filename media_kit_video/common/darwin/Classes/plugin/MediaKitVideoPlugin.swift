@@ -18,12 +18,25 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       let utils: UtilsProtocol? = Utils(registrar)
     #endif
 
+    // The manager has to be created here, not inside `init`: the platform view
+    // factory and the method channel must share one handle -> VideoOutput
+    // table, otherwise a PlatformView would attach to a different instance
+    // than the one the channel created.
+    let manager = VideoOutputManager(registry: registry)
+
+    #if os(iOS)
+      registrar.register(
+        MKVideoLayerViewFactory(manager: manager),
+        withId: MKVideoLayerViewFactory.viewType
+      )
+    #endif
+
     let channel = FlutterMethodChannel(
       name: CHANNEL_NAME,
       binaryMessenger: binaryMessenger
     )
     let instance = MediaKitVideoPlugin(
-      registry: registry,
+      manager: manager,
       channel: channel,
       utils: utils
     )
@@ -35,14 +48,12 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
   private let utils: UtilsProtocol?
 
   init(
-    registry: FlutterTextureRegistry,
+    manager: VideoOutputManager,
     channel: FlutterMethodChannel,
     utils: UtilsProtocol?
   ) {
     self.channel = channel
-    videoOutputManager = VideoOutputManager(
-      registry: registry
-    )
+    videoOutputManager = manager
     self.utils = utils
   }
 
@@ -81,12 +92,19 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
     videoOutputManager.create(
       handle: handle!,
       configuration: configuration,
-      textureUpdateCallback: { (_ textureId: Int64, _ size: CGSize) in
+      textureUpdateCallback: { (
+        _ textureId: Int64,
+        _ size: CGSize,
+        _ mode: VideoOutputMode
+      ) in
         self.channel.invokeMethod(
           "VideoOutput.Resize",
           arguments: [
             "handle": handle!,
             "id": textureId,
+            // The sink actually in use, so Dart never has to guess: it may ask
+            // for metalLayer and still get texture (iOS 15, Vulkan missing).
+            "mode": mode.rawValue,
             "rect": [
               "top": 0,
               "left": 0,

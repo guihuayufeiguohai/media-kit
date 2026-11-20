@@ -161,18 +161,32 @@ class NativeVideoController extends PlatformVideoController {
       },
     );
 
-    // Wait until first texture ID is received.
+    // The PlatformView receives this as creationParams so it can look up its
+    // VideoOutput in the native manager instead of creating a second renderer.
+    controller.handle = handle;
+
+    // Wait until the native side has picked a sink.
+    //
+    // In texture mode that means "first texture ID received". In metalLayer
+    // mode there is no texture ID at all, so waiting on [id] alone would hang
+    // forever -- [mode] flipping to metalLayer is the equivalent signal.
     // We are not waiting on the native-side itself because it will block the UI thread.
     final completer = Completer<void>();
     void listener() {
       final value = controller.id.value;
       if (value != null) {
         debugPrint('NativeVideoController: Texture ID: $value');
-        completer.complete();
+        if (!completer.isCompleted) completer.complete();
+        return;
+      }
+      if (controller.mode.value == VideoOutputMode.metalLayer) {
+        debugPrint('NativeVideoController: output mode: metalLayer');
+        if (!completer.isCompleted) completer.complete();
       }
     }
 
     controller.id.addListener(listener);
+    controller.mode.addListener(listener);
 
     await _channel.invokeMethod(
       'VideoOutputManager.Create',
@@ -183,12 +197,14 @@ class NativeVideoController extends PlatformVideoController {
           'height': configuration.height.toString(),
           'enableHardwareAcceleration':
               configuration.enableHardwareAcceleration,
+          'outputMode': configuration.outputMode.wire,
         },
       },
     );
 
     await completer.future;
     controller.id.removeListener(listener);
+    controller.mode.removeListener(listener);
 
     // Return the [VideoController].
     return controller;
@@ -264,7 +280,7 @@ class NativeVideoController extends PlatformVideoController {
               switch (call.method) {
                 case 'VideoOutput.Resize':
                   {
-                    // Notify about updated texture ID & [Rect].
+                    // Notify about the updated sink, texture ID & [Rect].
                     final int handle = call.arguments['handle'];
                     final Rect rect = Rect.fromLTWH(
                       call.arguments['rect']['left'] * 1.0,
@@ -273,8 +289,18 @@ class NativeVideoController extends PlatformVideoController {
                       call.arguments['rect']['height'] * 1.0,
                     );
                     final int id = call.arguments['id'];
+                    // Native is the final arbiter and reports what it actually
+                    // picked: it may answer metalLayer even when the app asked
+                    // for it on iOS 15, where the sink is unavailable.
+                    final VideoOutputMode mode = VideoOutputModeWire.parse(
+                      call.arguments['mode'] as String?,
+                    );
                     _controllers[handle]?.rect.value = rect;
-                    _controllers[handle]?.id.value = id;
+                    // -1 means "no FlutterTexture": the layer sink owns the
+                    // frames, so [id] has to stay null rather than become -1
+                    // (the widget would try to render Texture(textureId: -1)).
+                    _controllers[handle]?.id.value = id < 0 ? null : id;
+                    _controllers[handle]?.mode.value = mode;
                     // Notify about the first frame being rendered.
                     if (rect.width > 0 && rect.height > 0) {
                       final completer = _controllers[handle]

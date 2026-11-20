@@ -7,6 +7,125 @@ import Foundation
   import FlutterMacOS
 #endif
 
+#if os(iOS)
+  import UIKit
+  /// The native view a frame sink can draw into. iOS only; the protocol still
+  /// has to compile for macOS, where nothing implements it.
+  typealias VideoLayerView = UIView
+#else
+  typealias VideoLayerView = AnyObject
+#endif
+
+/// Which sink a rendered frame is delivered to.
+///
+/// `texture` is the FlutterTexture path (today's behaviour). `metalLayer` is
+/// the PlatformView + CAMetalLayer path, introduced in C2.
+public enum VideoOutputMode: String {
+  case texture
+  case metalLayer
+}
+
+/// Where a rendered frame goes.
+///
+/// `VideoOutput` drives this from its `Worker` thread -- a plain `Thread` plus
+/// a `DispatchSemaphore`, NOT a DispatchQueue -- so `present(_:)` must never
+/// block and must never hop to the main thread synchronously.
+///
+/// `activate()` / `resized()` / `attach(_:)` / `shutdown()` are only ever
+/// called on the main thread.
+protocol VideoFramePresenter: AnyObject {
+  var mode: VideoOutputMode { get }
+
+  /// Once, right after the renderer exists. Registers the FlutterTexture
+  /// (texture mode) or announces "layer mode, no texture id".
+  func activate()
+
+  /// After `texture.resize(size)`. Forwards the new video rect to Dart.
+  func resized(_ size: CGSize)
+
+  /// Immediately after `texture.render(size)`.
+  func present(_ size: CGSize)
+
+  /// `nil` means "no consumer attached".
+  func attach(_ view: VideoLayerView?)
+
+  /// On teardown.
+  func shutdown()
+}
+
+/// The FlutterTexture sink: everything C1 does today, moved out of
+/// `VideoOutput` unchanged.
+final class TexturePresenter: VideoFramePresenter {
+  let mode: VideoOutputMode = .texture
+
+  private let texture: ResizableTextureProtocol
+  private let registry: FlutterTextureRegistry
+  private let onResize: VideoOutput.TextureUpdateCallback
+  private var textureId: Int64 = -1
+
+  init(
+    texture: ResizableTextureProtocol,
+    registry: FlutterTextureRegistry,
+    onResize: @escaping VideoOutput.TextureUpdateCallback
+  ) {
+    self.texture = texture
+    self.registry = registry
+    self.onResize = onResize
+  }
+
+  func activate() {
+    // Textures must be registered on the platform thread.
+    textureId = registry.register(texture)
+    // textureUpdateCallback must run on the main thread
+    onResize(textureId, CGSize(width: 0, height: 0), .texture)
+  }
+
+  func resized(_ size: CGSize) {
+    // `sync` matches the pre-C1 behaviour exactly: VideoOutput already blocked
+    // here so the widget could lay out before the next present.
+    DispatchQueue.main.sync {
+      self.onResize(self.textureId, size, .texture)
+    }
+  }
+
+  func present(_ size: CGSize) {
+    // Async on purpose. This runs on Worker's single thread, so a synchronous
+    // hop makes the render loop wait for whatever the main thread is doing
+    // (Flutter's own compositing, layout, a platform channel...). At 24fps
+    // that is usually invisible; the moment one main-thread frame runs long,
+    // the render queue backs up behind it and playback stutters for seconds.
+    // -textureFrameAvailable only marks the texture dirty, so ordering against
+    // the next -render is not required -- Flutter samples whichever slot is
+    // current when it gets around to compositing.
+    //
+    // `weak self` + reading `textureId` at execution time (rather than
+    // snapshotting it) is deliberate: shutdown() sets it to -1, and a queued
+    // block must not poke a texture id that was already unregistered.
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, self.textureId >= 0 else { return }
+      // Textures must be marked as available from the main thread
+      self.registry.textureFrameAvailable(self.textureId)
+    }
+  }
+
+  func attach(_ view: VideoLayerView?) {
+    // Nothing to attach: Flutter samples the texture directly.
+  }
+
+  func shutdown() {
+    let registry_ = registry
+    let id = textureId
+    textureId = -1
+    // Also fixes a pre-existing hazard: a VideoOutput torn down before _init
+    // finished used to call unregisterTexture(-1).
+    guard id >= 0 else { return }
+    DispatchQueue.main.async {
+      // Textures must be unregistered on the platform thread
+      registry_.unregisterTexture(id)
+    }
+  }
+}
+
 // This class creates and manipulates the different types of FlutterTexture,
 // handles resizing, rendering calls, and notify Flutter when a new frame is
 // available to render.
@@ -15,7 +134,7 @@ import Foundation
 // dedicated thread.
 public class VideoOutput: NSObject {
   // Will be called on the main thread
-  public typealias TextureUpdateCallback = (Int64, CGSize) -> Void
+  public typealias TextureUpdateCallback = (Int64, CGSize, VideoOutputMode) -> Void
 
   private static let isSimulator: Bool = {
     let isSim: Bool
@@ -32,12 +151,24 @@ public class VideoOutput: NSObject {
   private let registry: FlutterTextureRegistry
   private let textureUpdateCallback: TextureUpdateCallback
   private let worker: Worker = .init()
+  // C1 plumbs this all the way from Dart but only ever honours `.texture`.
+  // C2 introduces MetalLayerPresenter and the branch that selects it.
+  private let requestedMode: VideoOutputMode
   private var width: Int64?
   private var height: Int64?
   private var texture: ResizableTextureProtocol!
-  private var textureId: Int64 = -1
+  private var presenter: VideoFramePresenter!
   private var currentSize: CGSize = CGSize.zero
   private var disposed: Bool = false
+  #if os(iOS)
+    // A PlatformView can be created before _init() has finished building the
+    // renderer, so the first attach is parked here and replayed afterwards.
+    private var pendingView: VideoLayerView?
+  #endif
+
+  /// The sink actually in use. Native is the final arbiter: Dart may ask for
+  /// `.metalLayer` and still get `.texture` (iOS 15, Vulkan unavailable, C1).
+  public var mode: VideoOutputMode { presenter?.mode ?? .texture }
 
   init(
     handle: Int64,
@@ -52,6 +183,7 @@ public class VideoOutput: NSObject {
     width = configuration.width
     height = configuration.height
     enableHardwareAcceleration = configuration.enableHardwareAcceleration
+    requestedMode = configuration.outputMode
     self.registry = registry
     self.textureUpdateCallback = textureUpdateCallback
 
@@ -66,7 +198,7 @@ public class VideoOutput: NSObject {
     worker.cancel()
 
     disposed = true
-    disposeTextureId()
+    presenter?.shutdown()
   }
 
   public func setSize(width: Int64?, height: Int64?) {
@@ -167,31 +299,59 @@ public class VideoOutput: NSObject {
       )
     }
 
+    // ---- choose the sink ---------------------------------------------------
+    //
+    // C1 has exactly one sink on purpose. `VideoOutputMode.metalLayer` is
+    // plumbed end-to-end (configuration -> channel -> `mode` notifier ->
+    // widget) but not honoured here yet: C2 adds MetalLayerPresenter and the
+    // branch that selects it. Keeping a single path is what makes "zero
+    // behaviour change" checkable -- if the picture moves at all, it is a bug.
+    if requestedMode == .metalLayer {
+      NSLog(
+        "VideoOutput: metalLayer requested but not wired in C1, staying on texture"
+      )
+    }
+    presenter = TexturePresenter(
+      texture: texture,
+      registry: registry,
+      onResize: textureUpdateCallback
+    )
+    NSLog("VideoOutput: output=texture")
+
     DispatchQueue.main.sync { [weak self]() in
       guard let that = self else {
         return
       }
-      that.registerTextureId()
+      that.presenter.activate()
+      #if os(iOS)
+        if let view = that.pendingView {
+          that.pendingView = nil
+          that.presenter.attach(view)
+        }
+      #endif
     }
   }
 
-  // Must be run on the main thread
-  private func registerTextureId() {
-    // Textures must be registered on the platform thread.
-    textureId = registry.register(texture)
-    // textureUpdateCallback must run on the main thread
-    textureUpdateCallback(textureId, CGSize(width: 0, height: 0))
-  }
-
-  private func disposeTextureId() {
-    let registry_ = self.registry
-    let textureId_ = self.textureId
-    textureId = -1
-    DispatchQueue.main.async {
-      // Textures must be unregistered on the platform thread
-      registry_.unregisterTexture(textureId_)
+  #if os(iOS)
+    /// Called on the main thread by the PlatformView when it enters a window.
+    /// Internal: `VideoLayerView` is an internal typealias, and only
+    /// `VideoOutputManager` (same module) calls this.
+    func attachLayerView(_ view: VideoLayerView) {
+      if let presenter = presenter {
+        presenter.attach(view)
+      } else {
+        pendingView = view
+      }
     }
-  }
+
+    /// Called on the main thread when the PlatformView leaves its window.
+    func detachLayerView(_ view: VideoLayerView) {
+      if pendingView === view {
+        pendingView = nil
+      }
+      presenter?.attach(nil)
+    }
+  #endif
 
   public func updateCallback() {
     worker.enqueue {
@@ -210,11 +370,7 @@ public class VideoOutput: NSObject {
       currentSize = size
 
       texture.resize(size)
-      DispatchQueue.main.sync { [weak self] in
-        guard let that = self else { return }
-        // textureUpdateCallback must run on the main thread
-        that.textureUpdateCallback(that.textureId, size)
-      }
+      presenter.resized(size)
     }
 
     if disposed {
@@ -222,19 +378,10 @@ public class VideoOutput: NSObject {
     }
 
     texture.render(size)
-    // Async on purpose. This runs on Worker's single thread, so a synchronous
-    // hop makes the render loop wait for whatever the main thread is doing
-    // (Flutter's own compositing, layout, a platform channel...). At 24fps
-    // that is usually invisible; the moment one main-thread frame runs long,
-    // the render queue backs up behind it and playback stutters for seconds.
-    // -textureFrameAvailable only marks the texture dirty, so ordering against
-    // the next -render is not required -- Flutter samples whichever slot is
-    // current when it gets around to compositing.
-    DispatchQueue.main.async { [weak self] in
-      guard let that = self else { return }
-      // Textures must be marked as available from the main thread
-      that.registry.textureFrameAvailable(that.textureId)
-    }
+    // The sink is the only thing that differs between texture and layer mode.
+    // `render` above always runs, so mpv's "render() not being called" watchdog
+    // can never be affected by whether a PlatformView happens to be attached.
+    presenter.present(size)
   }
 
     private var videoSize: CGSize {
@@ -255,5 +402,5 @@ public class VideoOutput: NSObject {
                                       ? params.dh
                                       : params.dw))
         )
-  }
+    }
 }

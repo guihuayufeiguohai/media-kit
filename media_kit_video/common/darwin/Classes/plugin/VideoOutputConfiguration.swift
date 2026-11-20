@@ -2,32 +2,44 @@ public class VideoOutputConfiguration {
   public let width: Int64?
   public let height: Int64?
   public let enableHardwareAcceleration: Bool
+  /// Which sink the frames should go to. Honoured on iOS only; C1 always
+  /// falls back to `.texture` inside `VideoOutput._init`.
+  public let outputMode: VideoOutputMode
 
   init(
     width: Int64?,
     height: Int64?,
-    enableHardwareAcceleration: Bool
+    enableHardwareAcceleration: Bool,
+    outputMode: VideoOutputMode = .texture
   ) {
     self.width = width
     self.height = height
     self.enableHardwareAcceleration = enableHardwareAcceleration
+    self.outputMode = outputMode
   }
 
   public static func fromDict(_ dict: [String: Any])
     -> VideoOutputConfiguration
   {
-    let widthStr = dict["width"] as! String
-    let heightStr = dict["height"] as! String
+    // These used to be `as!`. A Dart build that omitted one key (or a new
+    // key added on the Dart side first) crashed the app on the platform
+    // thread, which is impossible to catch -- parse defensively instead.
+    let widthStr = dict["width"] as? String
+    let heightStr = dict["height"] as? String
     let enableHardwareAcceleration =
-      dict["enableHardwareAcceleration"] as! Bool
+      dict["enableHardwareAcceleration"] as? Bool ?? true
+    let outputMode =
+      (dict["outputMode"] as? String).flatMap(VideoOutputMode.init(rawValue:))
+      ?? .texture
 
-    let width: Int64? = Int64(widthStr)
-    let height: Int64? = Int64(heightStr)
+    let width: Int64? = widthStr.flatMap { Int64($0) }
+    let height: Int64? = heightStr.flatMap { Int64($0) }
 
     return VideoOutputConfiguration(
       width: width,
       height: height,
-      enableHardwareAcceleration: enableHardwareAcceleration
+      enableHardwareAcceleration: enableHardwareAcceleration,
+      outputMode: outputMode
     )
   }
 }

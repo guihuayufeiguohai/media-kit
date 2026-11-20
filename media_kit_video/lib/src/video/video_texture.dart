@@ -6,6 +6,7 @@
 import 'dart:io';
 import 'dart:async';
 import 'package:flutter/widgets.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit_video/media_kit_video_controls/media_kit_video_controls.dart';
 
@@ -394,52 +395,88 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
                       valueListenable: widget.controller.notifier,
                       builder: (context, notifier, _) => notifier == null
                           ? const SizedBox.shrink()
-                          : ValueListenableBuilder<int?>(
-                              valueListenable: notifier.id,
-                              builder: (context, id, _) {
-                                return ValueListenableBuilder<Rect?>(
-                                  valueListenable: notifier.rect,
-                                  builder: (context, rect, _) {
-                                    if (id != null &&
-                                        rect != null &&
-                                        _visible) {
-                                      return SizedBox(
-                                        // Apply aspect ratio if provided.
-                                        width:
-                                            videoViewParameters.aspectRatio ==
-                                                    null
-                                                ? rect.width
-                                                : rect.height *
-                                                    videoViewParameters
-                                                        .aspectRatio!,
-                                        height: rect.height,
-                                        child: Stack(
-                                          children: [
-                                            const SizedBox(),
-                                            Positioned.fill(
-                                              child: Texture(
-                                                textureId: id,
-                                                filterQuality:
-                                                    videoViewParameters
-                                                        .filterQuality,
-                                              ),
-                                            ),
-                                            // Keep the |Texture| hidden before the first frame renders. In native implementation, if no default frame size is passed (through VideoController), a starting 1 pixel sized texture/surface is created to initialize the render context & check for H/W support.
-                                            // This is then resized based on the video dimensions & accordingly texture ID, texture, EGLDisplay, EGLSurface etc. (depending upon platform) are also changed. Just don't show that 1 pixel texture to the UI.
-                                            // NOTE: Unmounting |Texture| causes the |MarkTextureFrameAvailable| to not do anything on GNU/Linux.
-                                            if (rect.width <= 1.0 &&
-                                                rect.height <= 1.0)
-                                              Positioned.fill(
-                                                child: Container(
-                                                  color:
-                                                      videoViewParameters.fill,
+                          : ValueListenableBuilder<VideoOutputMode>(
+                              valueListenable: notifier.mode,
+                              builder: (context, mode, _) {
+                                return ValueListenableBuilder<int?>(
+                                  valueListenable: notifier.id,
+                                  builder: (context, id, _) {
+                                    return ValueListenableBuilder<Rect?>(
+                                      valueListenable: notifier.rect,
+                                      builder: (context, rect, _) {
+                                        final isLayer =
+                                            mode ==
+                                                VideoOutputMode.metalLayer;
+                                        // In layer mode there is no texture ID;
+                                        // the PlatformView owns the frames.
+                                        if ((id != null || isLayer) &&
+                                            rect != null &&
+                                            _visible) {
+                                          // Layer mode: lay the child out in
+                                          // device pixels so the
+                                          // CAMetalLayer drawable is not
+                                          // rect.size * dpr (a 4K video would
+                                          // otherwise get a 5760x3240
+                                          // drawable). FittedBox only uses the
+                                          // child's aspect ratio, so the
+                                          // picture is visually identical.
+                                          final dpr = isLayer
+                                              ? MediaQuery.devicePixelRatioOf(
+                                                  context,
+                                                )
+                                              : 1.0;
+                                          final width =
+                                              videoViewParameters.aspectRatio ==
+                                                      null
+                                                  ? rect.width
+                                                  : rect.height *
+                                                      videoViewParameters
+                                                          .aspectRatio!;
+                                          return SizedBox(
+                                            // Apply aspect ratio if provided.
+                                            width: width / dpr,
+                                            height: rect.height / dpr,
+                                            child: Stack(
+                                              children: [
+                                                const SizedBox(),
+                                                Positioned.fill(
+                                                  child: isLayer
+                                                      ? (notifier.handle != null
+                                                          ? _PlatformVideoView(
+                                                              handle: notifier
+                                                                  .handle!,
+                                                              key: ValueKey(
+                                                                'mk-layer-${notifier.handle}',
+                                                              ),
+                                                            )
+                                                          : const SizedBox
+                                                              .shrink())
+                                                      : Texture(
+                                                          textureId: id!,
+                                                          filterQuality:
+                                                              videoViewParameters
+                                                                  .filterQuality,
+                                                        ),
                                                 ),
-                                              ),
-                                          ],
-                                        ),
-                                      );
-                                    }
-                                    return const SizedBox.shrink();
+                                                // Keep the video hidden before the first frame renders. In native implementation, if no default frame size is passed (through VideoController), a starting 1 pixel sized texture/surface is created to initialize the render context & check for H/W support.
+                                                // This is then resized based on the video dimensions & accordingly texture ID, texture, EGLDisplay, EGLSurface etc. (depending upon platform) are also changed. Just don't show that 1 pixel texture to the UI.
+                                                // NOTE: Unmounting |Texture| causes the |MarkTextureFrameAvailable| to not do anything on GNU/Linux.
+                                                if (rect.width <= 1.0 &&
+                                                    rect.height <= 1.0)
+                                                  Positioned.fill(
+                                                    child: Container(
+                                                      color:
+                                                          videoViewParameters
+                                                              .fill,
+                                                    ),
+                                                  ),
+                                              ],
+                                            ),
+                                          );
+                                        }
+                                        return const SizedBox.shrink();
+                                      },
+                                    );
                                   },
                                 );
                               },
@@ -467,6 +504,43 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
           );
         },
       ),
+    );
+  }
+}
+
+/// Hosts the native `CAMetalLayer` on iOS.
+///
+/// Composition limits worth remembering when placing widgets above this view:
+///   * `ClipRect`, `SizedBox`, `FittedBox` and `Transform` work (Flutter maps
+///     them onto the UIView's frame / CA transform).
+///   * `ClipRRect` (rounded corners), `Opacity`, `ShaderMask` and
+///     `BackdropFilter` do NOT apply: the view is a real UIView composited by
+///     Core Animation, not part of Flutter's raster tree.
+///   * `Hero` transitions make the video jump for the same reason.
+///   * Screenshots (`RepaintBoundary.toImage`) do not include the video.
+class _PlatformVideoView extends StatelessWidget {
+  final int handle;
+
+  const _PlatformVideoView({
+    required this.handle,
+    super.key,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!Platform.isIOS) {
+      return const SizedBox.shrink();
+    }
+    return UiKitView(
+      viewType: 'media_kit_video/video_layer',
+      // Only the mpv handle: sizes come through VideoOutput.Resize so there is
+      // a single source of truth.
+      creationParams: {'handle': handle.toString()},
+      creationParamsCodec: const StandardMessageCodec(),
+      layoutDirection: TextDirection.ltr,
+      // Let the Flutter gesture detector above win the arena, otherwise
+      // tap-to-show-controls stops working over the video.
+      hitTestBehavior: PlatformViewHitTestBehavior.transparent,
     );
   }
 }

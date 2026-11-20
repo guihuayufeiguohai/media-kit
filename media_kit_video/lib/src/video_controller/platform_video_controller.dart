@@ -10,6 +10,31 @@ import 'package:media_kit/media_kit.dart';
 
 import 'package:media_kit_video/src/video_controller/video_controller.dart';
 
+/// Where rendered frames are delivered.
+enum VideoOutputMode {
+  /// FlutterTexture, registered through `FlutterTextureRegistry`.
+  ///
+  /// The only sink that works everywhere, and the only one the Flutter engine
+  /// accepts for external textures today (32BGRA / 420v / 420f).
+  texture,
+
+  /// PlatformView + `CAMetalLayer`. iOS 16+ only.
+  ///
+  /// Native is the final arbiter: iOS 15, a missing Vulkan renderer, or a build
+  /// where the layer sink is not wired yet all fall back to [texture]. The mode
+  /// actually in use is reported through [PlatformVideoController.mode].
+  metalLayer,
+}
+
+/// Wire format for [VideoOutputMode] over the method channel.
+extension VideoOutputModeWire on VideoOutputMode {
+  String get wire =>
+      this == VideoOutputMode.metalLayer ? 'metalLayer' : 'texture';
+
+  static VideoOutputMode parse(String? value) =>
+      value == 'metalLayer' ? VideoOutputMode.metalLayer : VideoOutputMode.texture;
+}
+
 /// {@template platform_video_controller}
 ///
 /// PlatformVideoController
@@ -33,6 +58,22 @@ abstract class PlatformVideoController {
 
   /// [Rect] of the video output, received from the native implementation.
   final ValueNotifier<Rect?> rect = ValueNotifier<Rect?>(null);
+
+  /// The sink actually in use, as reported by the native implementation.
+  ///
+  /// Native is the final arbiter, so this can differ from
+  /// [VideoControllerConfiguration.outputMode]: asking for
+  /// [VideoOutputMode.metalLayer] on iOS 15 (or on a build where the layer sink
+  /// is not wired yet) yields [VideoOutputMode.texture] here. The widget must
+  /// branch on this value, never on the configuration.
+  final ValueNotifier<VideoOutputMode> mode =
+      ValueNotifier<VideoOutputMode>(VideoOutputMode.texture);
+
+  /// The mpv handle this output belongs to.
+  ///
+  /// Passed to the PlatformView as `creationParams` so the view can find its
+  /// [VideoOutput] in the native manager without creating a second renderer.
+  int? handle;
 
   /// {@macro platform_video_controller}
   PlatformVideoController(
@@ -63,6 +104,7 @@ abstract class PlatformVideoController {
   void dispose() {
     id.dispose();
     rect.dispose();
+    mode.dispose();
   }
 }
 
@@ -121,6 +163,14 @@ class VideoControllerConfiguration {
   /// * [vo] != gpu : `false`
   final bool? androidAttachSurfaceAfterVideoParameters;
 
+  /// Which sink the frames should go to.
+  ///
+  /// iOS only; ignored on every other platform. Native is the final arbiter --
+  /// see [PlatformVideoController.mode] for the value actually in use.
+  ///
+  /// Default: [VideoOutputMode.texture]
+  final VideoOutputMode outputMode;
+
   /// {@macro video_controller_configuration}
   const VideoControllerConfiguration({
     this.vo,
@@ -130,6 +180,7 @@ class VideoControllerConfiguration {
     this.scale = 1.0,
     this.enableHardwareAcceleration = true,
     this.androidAttachSurfaceAfterVideoParameters,
+    this.outputMode = VideoOutputMode.texture,
   });
 
   /// Returns a copy of this class with the given fields replaced by the new values.
@@ -141,6 +192,7 @@ class VideoControllerConfiguration {
     int? height,
     bool? enableHardwareAcceleration,
     bool? androidAttachSurfaceAfterVideoParameters,
+    VideoOutputMode? outputMode,
   }) =>
       VideoControllerConfiguration(
         vo: vo ?? this.vo,
@@ -153,5 +205,6 @@ class VideoControllerConfiguration {
         androidAttachSurfaceAfterVideoParameters:
             androidAttachSurfaceAfterVideoParameters ??
                 this.androidAttachSurfaceAfterVideoParameters,
+        outputMode: outputMode ?? this.outputMode,
       );
 }
