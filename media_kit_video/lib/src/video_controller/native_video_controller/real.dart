@@ -208,52 +208,24 @@ class NativeVideoController extends PlatformVideoController {
     controller.id.removeListener(listener);
     controller.mode.removeListener(listener);
 
-    // Point mpv at PQ only once the layer sink is actually in use.
+    // Deliberately *not* setting mpv's `target-*` here.
     //
-    // The external texture path is 8-bit BGRA end to end, so asking for PQ
-    // there would just produce a dark, washed-out picture with nothing
-    // downstream able to fix it. The native side is the final arbiter of the
-    // sink, hence checking [mode] instead of the requested configuration.
-    if (configuration.outputEDR &&
-        controller.mode.value == VideoOutputMode.metalLayer) {
-      // This is a static factory, so reach the player through the argument
-      // rather than the (instance) `platform` getter.
-      final mpv = player.platform as NativePlayer;
-      // 1000 nits is a deliberate under-ask: iPhone panels peak somewhere
-      // around 1200, and iOS tone maps an EDR layer down when the current
-      // headroom is lower anyway. Asking for less than the panel can do keeps
-      // highlight detail instead of clipping it on the devices that fall short.
-      //
-      // `waitForInitialization: false` is mandatory, not an optimisation:
-      // the default path awaits `waitForVideoControllerInitializationIfAttached`,
-      // which is *this* controller's own completer -- waiting on it from inside
-      // create() deadlocks and the player page spins forever. mpv is already up
-      // by this point (VideoOutputManager.Create above used its handle), so the
-      // property writes are safe.
-      await mpv.setProperty(
-        'target-prim',
-        'bt.2020',
-        waitForInitialization: false,
-      );
-      await mpv.setProperty(
-        'target-trc',
-        'pq',
-        waitForInitialization: false,
-      );
-      await mpv.setProperty(
-        'target-peak',
-        '1000',
-        waitForInitialization: false,
-      );
-      await mpv.setProperty(
-        'target-contrast',
-        'auto',
-        waitForInitialization: false,
-      );
-      debugPrint(
-        'NativeVideoController: EDR output: pq/bt.2020/1000nits',
-      );
-    }
+    // Those are global options: whatever is set at create() applies to every
+    // clip, and the VO builds its filter chain with them before the first frame
+    // exists. Setting PQ up front therefore made every SDR clip start out
+    // PQ-encoded -- the first ~0.2s came out grey-white until the native side
+    // noticed `video-out-params/gamma = bt.1886` and put the target back to
+    // `auto`. On device that measured `probe max=0.568` (PQ-coded) instead of
+    // 1.000 for the first frames.
+    //
+    // The layer sink owns this decision now: it reads the transfer function mpv
+    // is really producing, per clip, and sets `target-trc`/`target-prim`/
+    // `target-peak` to `pq`/`bt.2020`/`1000` only for pq/hlg sources. SDR
+    // sources keep mpv's own defaults, which is the path verified in C3.
+    debugPrint(
+      'NativeVideoController: EDR output: layer decides per clip '
+      '(outputEDR=${configuration.outputEDR}, mode=${controller.mode.value})',
+    );
 
     // Return the [VideoController].
     return controller;

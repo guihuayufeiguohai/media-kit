@@ -70,6 +70,14 @@ import UIKit
       qos: .userInteractive
     )
 
+    // Every `mpv_set_property` call lands here: one writer at a time, on a
+    // thread that is neither main (can cycle with `resized`'s main.sync) nor
+    // Worker (the render thread, which the play loop may be waiting for).
+    private let targetQueue = DispatchQueue(
+      label: "media_kit_video.metal.target",
+      qos: .userInitiated
+    )
+
     // Diagnostics only; deliberately unsynchronised. Losing a count here is
     // preferable to taking a lock in the per-frame path.
     private var presented = 0
@@ -210,11 +218,22 @@ import UIKit
         NSLog("MetalLayer: detached")
         return
       }
+      // Best effort pre-arm: `video-params` is filled in as soon as the VO has a
+      // decoded frame, which is typically 100-200ms before the first present.
+      // Reading it here gets mpv's target and the layer tag right *before* that
+      // frame is rendered, instead of after it.
+      stateLock.lock()
+      let known = mpvGamma
+      stateLock.unlock()
+      var primed: String? = nil
+      if known == nil, let handle = mpvHandle {
+        primed = MPVHelpers.getStringProperty(handle, "video-params/gamma")
+      }
       // The view is a fresh layer every time (route push/pop, Hero), so this
       // has to configure unconditionally rather than trust `appliedHDR`.
-      applyDrawable(gamma: mpvGamma, reason: "attach")
+      applyDrawable(gamma: primed ?? known, reason: "attach")
       NSLog(
-        "MetalLayer: attached \(view.bounds.size) drawable=\(appliedHDR == true ? "rgba16f/pq" : "bgra8/srgb") edrCapable=\(edrCapable ? 1 : 0)"
+        "MetalLayer: attached \(view.bounds.size) drawable=\(appliedHDR == true ? "rgba16f/pq" : "bgra8/srgb") edrCapable=\(edrCapable ? 1 : 0) primed=\(primed ?? "-")"
       )
     }
 
@@ -231,14 +250,13 @@ import UIKit
     private func applyDrawable(gamma: String?, reason: String) {
       stateLock.lock()
       let view = self.view
+      if gamma != nil { mpvGamma = gamma }
       stateLock.unlock()
 
       // `edrCapable` still gates the decision: without a PQ colorspace there is
       // nowhere to put an HDR transfer, and `syncLayerToMPV` never reports one.
       let hdr = edrCapable && MetalLayerPresenter.isHDR(gamma)
       appliedHDR = hdr
-      // Only once mpv has actually answered: before that we would be undoing
-      // Dart's PQ request and then re-applying it one frame later.
       if gamma != nil { applyMPVTarget(hdr: hdr) }
       guard let layer = view?.layer as? CAMetalLayer else { return }
 
@@ -328,52 +346,67 @@ import UIKit
       )
     }
 
-    /// Keeps mpv's own target in step with the clip, not with the config.
+    /// Keeps mpv's target in step with the clip rather than with the config.
     ///
-    /// Dart sets `target-trc=pq` / `target-prim=bt.2020` / `target-peak=1000`
-    /// once at `create()`, before anything is playing. For an HDR clip that is
-    /// exactly right. For an SDR clip it leaves mpv believing the display is an
-    /// HDR one, and the picture no longer matches the verified SDR path (C3),
-    /// where those options were never touched -- that is the residual
-    /// grey-white cast on SDR after the drawable was fixed.
+    /// `target-*` are global options, and the VO builds its chain with whatever
+    /// they say at that moment -- before the first frame exists. So the decision
+    /// has to be made per clip, from the source transfer:
     ///
-    /// Bounded by construction: the desired value comes from the *source*
-    /// transfer (`video-out-params/gamma`), so writing `target-trc` cannot feed
-    /// back into the reading that drives it.
+    /// | source `gamma` | target |
+    /// |---|---|
+    /// | `pq` / `hlg` | `pq` / `bt.2020` / `1000` (== C4, verified) |
+    /// | anything else | `auto` / `auto` / `auto` (== C3, verified) |
     ///
-    /// Main thread only. mpv marshals property writes onto the play loop, which
-    /// can be waiting for the render thread -- writing from Worker is the C4.1
-    /// deadlock in a new costume.
+    /// With those two cases the *ring* always matches the layer tag: PQ sources
+    /// pass through untouched, SDR sources are left coded -- and measured on
+    /// device, the SDR case reads `probe max≈0.57` when the target is PQ (the
+    /// GPU converts in the shader) versus `1.000` when it is auto. That is the
+    /// grey-white first frame users saw: the target was PQ while the tag was
+    /// sRGB.
+    ///
+    /// Serialised on `targetQueue`, never main: `mpv_set_property` waits for the
+    /// core's play loop, which can itself be waiting for the render thread. From
+    /// main that cycles with `resized()`'s `main.sync`; from Worker it is the
+    /// C4.1 deadlock.
     private func applyMPVTarget(hdr: Bool) {
       guard edrCapable, let handle = mpvHandle else { return }
       let trc = hdr ? "pq" : "auto"
-      // mpv reports the current choice back as a string ("pq"/"auto"/...).
-      guard MPVHelpers.getStringProperty(handle, "target-trc") != trc else {
-        return
+      targetQueue.async { [weak self] in
+        guard let self = self, !self.isClosed else { return }
+        // mpv reports the current choice back as a string ("pq"/"auto"/...).
+        guard MPVHelpers.getStringProperty(handle, "target-trc") != trc else {
+          return
+        }
+        var ok = MPVHelpers.setStringProperty(handle, "target-trc", trc)
+        ok =
+          MPVHelpers.setStringProperty(
+            handle, "target-prim", hdr ? "bt.2020" : "auto") && ok
+        ok =
+          MPVHelpers.setStringProperty(
+            handle, "target-peak", hdr ? "1000" : "auto") && ok
+        NSLog(
+          "MetalLayer: mpv target -> trc=\(trc) prim=\(hdr ? "bt.2020" : "auto") peak=\(hdr ? "1000" : "auto")\(ok ? "" : " FAILED")"
+        )
       }
-      let ok = MPVHelpers.setStringProperty(handle, "target-trc", trc)
-      var allOk = MPVHelpers.setStringProperty(
-        handle, "target-prim", hdr ? "bt.2020" : "auto")
-      allOk =
-        MPVHelpers.setStringProperty(
-          handle, "target-peak", hdr ? "1000" : "auto") && allOk
-      NSLog(
-        "MetalLayer: mpv target -> trc=\(trc) prim=\(hdr ? "bt.2020" : "auto") peak=\(hdr ? "1000" : "auto")\(ok && allOk ? "" : " FAILED")"
-      )
     }
 
-    /// Asks mpv which transfer function the frames in the ring are in.
+    private var isClosed: Bool {
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return closed
+    }
+
+    /// Asks mpv which transfer function the clip is in.
     ///
-    /// `video-target-params` would be the right source (`vo_get_target_params`),
+    /// `video-target-params` would be the natural source (`vo_get_target_params`),
     /// but this mpv build (0.41.0) does not export it: the property reads back
-    /// NULL, which C4.2 treated as "not HDR" for *every* clip -- SDR and DV P5
-    /// alike -- so the layer was never tagged PQ again.
+    /// NULL, which C4.2 treated as "not HDR" for *every* clip and left even DV P5
+    /// tagged sRGB.
     ///
-    /// `video-out-params` is available and, in this pipeline, accurate: the VO
-    /// does not convert (SDR keeps `bt.1886` even with `target-trc=pq` set, DV
-    /// arrives as `pq`), so it is exactly what lands in the IOSurface. If the
-    /// VO ever starts converting, this reading and the picture will disagree --
-    /// the log line below is what tells them apart.
+    /// `video-out-params/gamma` reports the frame **before** the GPU chain, i.e.
+    /// the source transfer (SDR `bt.1886`, DV `pq`). That is exactly what
+    /// `applyMPVTarget` needs to decide the target -- not a claim about what the
+    /// ring contains. The ring matches `target-*`, so tag = target = f(source).
     ///
     /// Runs on Worker, from `present`. Fast poll right after a reconfig (mpv
     /// may still report the previous clip), then one read every 30 frames so a
@@ -388,8 +421,12 @@ import UIKit
           "video-out-params/gamma"
         )
       else { return }
-      if mpvGamma == gamma { return }
-      mpvGamma = gamma
+      // Written by `attach` on main, so it needs the lock.
+      stateLock.lock()
+      let changed = (mpvGamma != gamma)
+      if changed { mpvGamma = gamma }
+      stateLock.unlock()
+      guard changed else { return }
       DispatchQueue.main.async { [weak self] in
         self?.applyDrawable(gamma: gamma, reason: "video-out-params/gamma=\(gamma)")
       }
