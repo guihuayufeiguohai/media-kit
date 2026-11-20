@@ -223,10 +223,33 @@ class NativeVideoController extends PlatformVideoController {
       // around 1200, and iOS tone maps an EDR layer down when the current
       // headroom is lower anyway. Asking for less than the panel can do keeps
       // highlight detail instead of clipping it on the devices that fall short.
-      await mpv.setProperty('target-prim', 'bt.2020');
-      await mpv.setProperty('target-trc', 'pq');
-      await mpv.setProperty('target-peak', '1000');
-      await mpv.setProperty('target-contrast', 'auto');
+      //
+      // `waitForInitialization: false` is mandatory, not an optimisation:
+      // the default path awaits `waitForVideoControllerInitializationIfAttached`,
+      // which is *this* controller's own completer -- waiting on it from inside
+      // create() deadlocks and the player page spins forever. mpv is already up
+      // by this point (VideoOutputManager.Create above used its handle), so the
+      // property writes are safe.
+      await mpv.setProperty(
+        'target-prim',
+        'bt.2020',
+        waitForInitialization: false,
+      );
+      await mpv.setProperty(
+        'target-trc',
+        'pq',
+        waitForInitialization: false,
+      );
+      await mpv.setProperty(
+        'target-peak',
+        '1000',
+        waitForInitialization: false,
+      );
+      await mpv.setProperty(
+        'target-contrast',
+        'auto',
+        waitForInitialization: false,
+      );
       debugPrint(
         'NativeVideoController: EDR output: pq/bt.2020/1000nits',
       );
