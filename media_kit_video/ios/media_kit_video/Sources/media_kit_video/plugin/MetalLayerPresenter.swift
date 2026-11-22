@@ -195,6 +195,10 @@ import UIKit
         object: nil
       )
 
+      // Before any media is loaded, so mpv builds every clip's chain with the
+      // final target from the very first frame. This is what actually removes
+      // the first-frame race: there is nothing left to change later.
+      applyVideoTarget()
       NSLog(
         "MetalLayer: init device=\(device.name) src=\(pixelFormat16F ? "rgba16f" : "bgra8") edrCapable=\(edrCapable ? 1 : 0) drawable=pending"
       )
