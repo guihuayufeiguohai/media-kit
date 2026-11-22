@@ -41,14 +41,20 @@ import UIKit
     private let mpvHandle: OpaquePointer?
     /// Whether the layer ended up presenting EDR content. Diagnostics only.
     private var layerIsEDR = false
-    /// Frames since the last reconfig; sets the property poll rate. Both
-    /// writers (`resized` and `present`) run on Worker.
-    private var framesSinceResize = 0
-    /// One pixel-value probe per clip. See `probeFrameRange`.
-    private var probePending = true
-    /// Second probe once playback has settled. The first frame of a clip is
-    /// often black or a fade-in, which says nothing about the mapping.
-    private var steadyProbePending = true
+    /// Bumped when a clip starts (new texture) or a fresh view is attached to
+    /// one. The present queue keeps its own probe state and resets it when this
+    /// changes, so nothing has to be shared across threads.
+    private var clipGeneration = 0
+    /// When the current clip's sink came up. Printed next to every probe sample
+    /// so "how long is the screen black" is a number, not a feeling.
+    private var clipStartedAt: CFTimeInterval = 0
+
+    // Probe series state. `presentQueue` only.
+    private var probedGeneration = -1
+    private var framesThisClip = 0
+    private var probeAtFrame = 1
+    private var probeStep = 1
+    private var probeSamples = 0
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -215,11 +221,12 @@ import UIKit
     }
 
     func resized(_ size: CGSize) {
-      // New content, new probe. Nothing else depends on the clip any more: the
-      // layer configuration and mpv's target are both constant.
-      framesSinceResize = 0
-      probePending = true
-      steadyProbePending = true
+      // New clip: restart the probe series. Nothing else depends on the clip any
+      // more -- the layer configuration and mpv's target are both constant.
+      stateLock.lock()
+      clipGeneration += 1
+      clipStartedAt = CACurrentMediaTime()
+      stateLock.unlock()
       DispatchQueue.main.sync {
         self.onResize(-1, size, .metalLayer)
       }
@@ -228,6 +235,10 @@ import UIKit
     func attach(_ view: VideoLayerView?) {
       stateLock.lock()
       self.view = view
+      if view != nil {
+        clipGeneration += 1
+        clipStartedAt = CACurrentMediaTime()
+      }
       stateLock.unlock()
       guard let view = view else {
         NSLog("MetalLayer: detached")
@@ -339,7 +350,7 @@ import UIKit
     }
 
     /// Samples a sparse grid of the frame mpv just produced and logs its range.
-    /// One shot per clip; runs on `presentQueue`.
+    /// Runs on `presentQueue`, for the first eight frames of each clip.
     ///
     /// This is the only honest answer to "what is in the ring": every mpv
     /// property describes the frame *before* the GPU chain, and that chain is
@@ -529,17 +540,35 @@ import UIKit
         return
       }
 
-      // Numbers beat reasoning here: `video-out-params` is the vf chain's
-      // output, NOT what the GPU wrote into the ring, so it cannot tell us
-      // whether mpv converted. A bright frame has max=1.0 if the ring is coded
-      // (bt.1886/sRGB/linear-scaled), and ≈0.51 if it is PQ (SDR white = 100
-      // nits = PQ 0.508).
-      if probePending {
-        probePending = false
-        probeFrameRange(pixelBuffer, label: "first")
-      } else if steadyProbePending, framesSinceResize >= 30 {
-        steadyProbePending = false
-        probeFrameRange(pixelBuffer, label: "steady")
+      // Probe *series* rather than a single sample.
+      //
+      // The question this has to answer is "how long is the picture black at the
+      // start", and one sample at frame 1 cannot tell a black *clip* from a
+      // black *frame* -- which is exactly the ambiguity that made the last round
+      // of reports unanswerable. Samples land at frames 1, 2, 4, 8, 16, 32, 64
+      // and stop: eight CVPixelBuffer locks per clip, so it stays off the frame
+      // budget.
+      stateLock.lock()
+      let generation = clipGeneration
+      let startedAt = clipStartedAt
+      stateLock.unlock()
+      if generation != probedGeneration {
+        probedGeneration = generation
+        framesThisClip = 0
+        probeAtFrame = 1
+        probeStep = 1
+        probeSamples = 0
+      }
+      framesThisClip += 1
+      if probeSamples < 8, framesThisClip >= probeAtFrame {
+        probeSamples += 1
+        probeFrameRange(
+          pixelBuffer,
+          label:
+            "frame \(framesThisClip) +\(Int((CACurrentMediaTime() - startedAt) * 1000))ms"
+        )
+        probeAtFrame += probeStep
+        if probeStep < 32 { probeStep *= 2 }
       }
 
       // Picked from the drawable, not from shared state: the format can change
