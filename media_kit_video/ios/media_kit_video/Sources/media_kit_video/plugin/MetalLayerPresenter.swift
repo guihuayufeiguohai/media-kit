@@ -242,6 +242,21 @@ import UIKit
         name: UIApplication.willEnterForegroundNotification,
         object: nil
       )
+      // `inactive` 也要停：拉控制中心、下拉通知、截图、来电这些都会短暂
+      // resign active，而 CAMetalLayer 在这段时间里拿不到 drawable。之前只挡了
+      // `didEnterBackground`，所以这些场景会漏 —— 表现出来就是"截屏/下拉时卡一下"。
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(onBackground),
+        name: UIApplication.willResignActiveNotification,
+        object: nil
+      )
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(onForeground),
+        name: UIApplication.didBecomeActiveNotification,
+        object: nil
+      )
 
       // Neutral default before any media exists. `resized` moves it to the
       // clip's container as soon as the source transfer is known -- still
@@ -841,6 +856,12 @@ import UIKit
 
     // MARK: - private
 
+    /// `didEnterBackground` 与 `willResignActive` 都走这里。
+    ///
+    /// 两者都要停上屏：后台时 CAMetalLayer 不会给 drawable，而 inactive
+    /// （控制中心 / 通知中心 / 截图 / 来电横幅）期间合成器也会暂停这一层，
+    /// `nextDrawable` 卡住会连带把渲染线程拖住，mpv 于是报
+    /// "render() not being called or stuck"，恢复后要等一次重建。
     @objc private func onBackground() {
       stateLock.lock()
       suspended = true
