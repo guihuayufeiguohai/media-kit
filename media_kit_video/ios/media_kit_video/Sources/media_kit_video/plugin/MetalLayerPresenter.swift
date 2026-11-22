@@ -58,6 +58,13 @@ import UIKit
     /// rendered with the previous target, and that frame must not be shown: it
     /// would be tagged for the new transfer while carrying the old one.
     private var skipPresentFrames = 0
+    /// 1 while the ring is still rendered for a target other than the one the
+    /// layer is tagged for. Presentation pauses instead of showing a frame whose
+    /// content and tag disagree.
+    private var holdFrames = 0
+    /// Hard stop for the hold, so a rejected property write cannot leave a black
+    /// screen behind.
+    private var holdDeadline: CFTimeInterval = 0
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -92,6 +99,7 @@ import UIKit
     private var skippedBusy = 0
     private var skippedNoView = 0
     private var skippedStale = 0
+    private var skippedHold = 0
     private var maxDrawMs: Double = 0
     private var firstPresentLogged = false
     private var lastStats = CACurrentMediaTime()
@@ -227,29 +235,33 @@ import UIKit
         NSLog("MetalLayer: detached")
         return
       }
-      // Tag for what mpv is writing *now*, not for what the clip is: the two
-      // differ until a target change lands, and a tag that runs ahead of the
-      // content is a wrong picture (the grey DV first frame in C4.5).
-      let tag = MetalLayerPresenter.transferTag(
-        mpvHandle.flatMap { MPVHelpers.getStringProperty($0, "target-trc") }
-      )
-      // The view is a fresh layer every time (route push/pop, Hero), so this
-      // has to configure unconditionally rather than trust `appliedHDR`.
-      applyDrawable(gamma: tag, reason: "attach")
-      // Pre-arm: `video-params` is filled in as soon as the VO has a decoded
-      // frame, typically 100-200ms before the first present. Getting the target
-      // right here is what keeps an HDR start from being SDR-mapped first.
+      // Tag for what the *clip* is, and do it before the layer ever owns a
+      // drawable.
+      //
+      // C4.6 tagged from `target-trc` instead, which meant an HDR clip started
+      // out as a bgra8 + sRGB + EDR-off layer and was switched to 16F + PQ +
+      // EDR one frame later. That switch is not just a repaint: a layer that has
+      // already been composited as SDR does not reliably get adopted as EDR
+      // content afterwards. On device the picture then reads washed out to the
+      // eye (PQ shown with no headroom) while a *screenshot* is correct (the
+      // capture path honours the colorspace), and rotating fixes it only for as
+      // long as the compositor is re-laying the layer out. Configuring EDR up
+      // front -- the C4/C4.4/C4.5 shape, which looked right -- avoids the
+      // SDR-to-EDR transition entirely.
       let source = mpvHandle.flatMap {
         MPVHelpers.getStringProperty($0, "video-params/gamma")
       }
+      let tag = MetalLayerPresenter.transferTag(source)
+      // The view is a fresh layer every time (route push/pop, Hero), so this
+      // has to configure unconditionally rather than trust `appliedHDR`.
+      applyDrawable(gamma: tag, reason: "attach")
+      // Pre-arm mpv so the very first frames are already in `tag`, not SDR.
       if let source = source {
         applyMPVTarget(hdr: MetalLayerPresenter.isHDR(source))
       }
       // An attached layer with `isOpaque = true` and no drawable yet composites
-      // as *white*, not black. On an HDR clip the first real frame is 200-500ms
-      // away (mpv has to be told the target, then reconfigure), and that window
-      // is exactly the "white veil on the first frame" users report. Painting
-      // black costs one drawable and makes the wait invisible.
+      // as *white*, not black. Until the first real frame arrives (200-500ms on
+      // HDR) that window is the "white veil on the first frame" users report.
       paintBlack(layer: view.layer as? CAMetalLayer)
       NSLog(
         "MetalLayer: attached \(view.bounds.size) tag=\(tag ?? "sdr") edrCapable=\(edrCapable ? 1 : 0) source=\(source ?? "-")"
@@ -289,6 +301,15 @@ import UIKit
       if layer.pixelFormat != format {
         layer.pixelFormat = format
       }
+      // EDR *before* the colorspace: a layer that is still flagged as SDR can
+      // have an HDR colorspace clamped, and the layer then keeps looking SDR
+      // even though `colorspace` was assigned. Cheap to get right, invisible
+      // when it does not matter.
+      if #available(iOS 16.0, *) {
+        if layer.wantsExtendedDynamicRangeContent != hdr {
+          layer.wantsExtendedDynamicRangeContent = hdr
+        }
+      }
       if hdr {
         // HLG is not PQ -- same 16F + EDR treatment, different transfer curve.
         layer.colorspace =
@@ -298,11 +319,17 @@ import UIKit
       } else {
         layer.colorspace = srgbColorspace
       }
+      // Read back what the layer actually holds. The washed-out DV report was
+      // "composited as SDR while tagged PQ", which is invisible from the code
+      // path but obvious here -- a clamped colorspace or a dropped EDR flag.
+      let cs = layer.colorspace.map { String(describing: $0.name) } ?? "nil"
+      var headroom = ""
       if #available(iOS 16.0, *) {
-        layer.wantsExtendedDynamicRangeContent = hdr
+        headroom =
+          " edrHeadroom=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom))/\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom))"
       }
       NSLog(
-        "MetalLayer: drawable \(hdr ? "rgba16f/\(gamma ?? "?") edr=1" : "bgra8/srgb edr=0") (\(reason))"
+        "MetalLayer: drawable \(hdr ? "rgba16f/\(gamma ?? "?") edr=1" : "bgra8/srgb edr=0") pf=\(layer.pixelFormat.rawValue) cs=\(cs) wantsEDR=\(layer.wantsExtendedDynamicRangeContent ? 1 : 0)\(headroom) (\(reason))"
       )
     }
 
@@ -446,12 +473,6 @@ import UIKit
         ok =
           MPVHelpers.setStringProperty(
             handle, "target-peak", hdr ? "1000" : "auto") && ok
-        if ok {
-          // The next drawable(s) may still carry a frame mpv rendered with the
-          // old target. Dropping two costs ~80ms of black at clip start and
-          // removes the one-frame colour jump entirely.
-          self.skipPresentFrames = 2
-        }
         NSLog(
           "MetalLayer: mpv target -> trc=\(trc) prim=\(hdr ? "bt.2020" : "auto") peak=\(hdr ? "1000" : "auto")\(ok ? "" : " FAILED")"
         )
@@ -464,17 +485,20 @@ import UIKit
       return closed
     }
 
-    /// Asks mpv which transfer function the clip is in.
+    /// Keeps mpv's target in step with the clip, and holds the picture until it
+    /// agrees.
     ///
-    /// `video-target-params` would be the natural source (`vo_get_target_params`),
-    /// but this mpv build (0.41.0) does not export it: the property reads back
-    /// NULL, which C4.2 treated as "not HDR" for *every* clip and left even DV P5
-    /// tagged sRGB.
+    /// The layer is tagged from the **source** (`video-out-params/gamma`) so it
+    /// is configured as EDR + PQ once, before its first drawable, and never
+    /// transitions from SDR to EDR afterwards -- that transition is what left
+    /// the DV picture washed out on device while a screenshot stayed correct.
     ///
-    /// `video-out-params/gamma` reports the frame **before** the GPU chain, i.e.
-    /// the source transfer (SDR `bt.1886`, DV `pq`). That is exactly what
-    /// `applyMPVTarget` needs to decide the target -- not a claim about what the
-    /// ring contains. The ring matches `target-*`, so tag = target = f(source).
+    /// The mismatch in the other direction (ring still SDR-mapped while the
+    /// layer is already tagged PQ) is handled by *not presenting* until
+    /// `target-trc` agrees with the source. `mpv_set_property` cannot land
+    /// before the first frame is rendered -- the play loop is blocked waiting
+    /// for exactly that frame -- so this window is unavoidable; it is covered by
+    /// the black frame painted in `attach`.
     ///
     /// Runs on Worker, from `present`. Fast poll right after a reconfig (mpv
     /// may still report the previous clip), then one read every 30 frames so a
@@ -484,35 +508,40 @@ import UIKit
       framesSinceResize += 1
       if framesSinceResize >= 90 && framesSinceResize % 30 != 0 { return }
 
-      // 1) Which transfer is mpv writing right now? That is the only thing the
-      //    layer may be tagged with.
-      let tag = MetalLayerPresenter.transferTag(
+      guard
+        let source = MPVHelpers.getStringProperty(
+          handle,
+          "video-out-params/gamma"
+        )
+      else { return }
+      let want = MetalLayerPresenter.transferTag(source)
+      let now = MetalLayerPresenter.transferTag(
         MPVHelpers.getStringProperty(handle, "target-trc")
       )
 
-      // 2) Keep mpv's target in step with the clip. Nothing to do when they
-      //    already agree, which is why SDR never logs a write.
-      if let source = MPVHelpers.getStringProperty(
-        handle,
-        "video-out-params/gamma"
-      ) {
-        let wantHDR = MetalLayerPresenter.isHDR(source)
-        if wantHDR != (tag != nil) {
-          applyMPVTarget(hdr: wantHDR)
+      // 1) Tag from the clip. This is what the layer should *be*, and it is
+      //    stable for the whole clip, so the layer format never flips mid-play.
+      stateLock.lock()
+      let retag = (mpvGamma != want)
+      if retag { mpvGamma = want }
+      stateLock.unlock()
+      if retag {
+        DispatchQueue.main.async { [weak self] in
+          self?.applyDrawable(gamma: want, reason: "video-out-params/gamma=\(source)")
         }
       }
 
-      // 3) Re-tag when the target moved.
-      stateLock.lock()
-      let changed = (mpvGamma != tag)
-      if changed { mpvGamma = tag }
-      stateLock.unlock()
-      guard changed else { return }
-      DispatchQueue.main.async { [weak self] in
-        self?.applyDrawable(
-          gamma: tag,
-          reason: "target-trc=\(tag ?? "auto")"
-        )
+      // 2) Drive mpv to agree, and hold the picture until it does.
+      if want != now {
+        if holdFrames == 0 {
+          holdFrames = 1
+          holdDeadline = CACurrentMediaTime() + 3.0
+        }
+        applyMPVTarget(hdr: want != nil)
+      } else if holdFrames > 0 {
+        holdFrames = 0
+        // Frames already in the ring were rendered with the old target.
+        skipPresentFrames = 2
       }
     }
 
@@ -532,6 +561,16 @@ import UIKit
       // API call this class makes stays on one thread and the frame counter
       // needs no synchronisation.
       syncLayerToMPV()
+
+      if holdFrames > 0 {
+        if CACurrentMediaTime() < holdDeadline {
+          skippedHold += 1
+          return
+        }
+        // Something never converged; show the frame rather than a black screen.
+        holdFrames = 0
+        skipPresentFrames = 2
+      }
 
       if skipPresentFrames > 0 {
         skipPresentFrames -= 1
@@ -716,7 +755,7 @@ import UIKit
       let now = CACurrentMediaTime()
       if now - lastStats >= 5.0 {
         NSLog(
-          "MetalLayer: stats presented=\(presented) nil=\(skippedNil) busy=\(skippedBusy) noview=\(skippedNoView) stale=\(skippedStale) drawMax=\(Int(maxDrawMs))ms"
+          "MetalLayer: stats presented=\(presented) nil=\(skippedNil) busy=\(skippedBusy) noview=\(skippedNoView) stale=\(skippedStale) hold=\(skippedHold) drawMax=\(Int(maxDrawMs))ms"
         )
         lastStats = now
       }
