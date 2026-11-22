@@ -281,6 +281,9 @@ import UIKit
       // container must not change then (it would be a mid-life flip), so keep
       // the one already in use and say so.
       let canApply = (view == nil) || (container == self.container)
+        || !firstPresentLogged
+      let needsLateConfigure = canApply && (view != nil)
+        && (container != self.container)
       if canApply { desiredContainer = container }
       framesToSkip = 0
       holdDeadline = CACurrentMediaTime() + 1.5
@@ -301,7 +304,22 @@ import UIKit
 
       if canApply {
         applyVideoTarget(for: applied, sourceIsHDR: isHDRSource)
-      } else {
+      }
+      if needsLateConfigure {
+        // `attach` ran before `video-params` was filled in (no size change to
+        // trigger this callback), so the layer was born as SDR. Correct it while
+        // nothing has been presented yet -- after the first present a change
+        // would leave the layer with a stale identity (C4.8).
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self, !self.isClosed else { return }
+          self.stateLock.lock()
+          self.container = container
+          self.stateLock.unlock()
+          self.configureLayer(container: container)
+          NSLog("MetalLayer: late container fix -> \(container.rawValue)")
+        }
+      }
+      if !canApply {
         NSLog(
           "MetalLayer: container change to \(container.rawValue) ignored (layer already composited as \(self.container.rawValue))"
         )
