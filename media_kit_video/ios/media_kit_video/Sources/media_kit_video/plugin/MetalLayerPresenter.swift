@@ -263,17 +263,8 @@ import UIKit
       // first present. Deciding here (and applying at `attach`, which follows
       // within a few ms) is the only window where changing the container is
       // safe, because the layer does not own a drawable yet.
-      let source = mpvHandle.flatMap {
-        MPVHelpers.getStringProperty($0, "video-params/gamma")
-      }
-      let wantsHDR =
-        source == "pq" || source == "hlg"
-        || source?.hasPrefix("dolbyvision") == true
-      // Low Power Mode takes the EDR headroom away; claiming EDR then paints a
-      // blown-out picture. Hand the clip to mpv's SDR tone mapper instead.
-      let hdrAllowed = !ProcessInfo.processInfo.isLowPowerModeEnabled
-      let container: Container =
-        (wantsHDR && edrCapable && hdrAllowed) ? .pq : .sdr
+      let source = currentSourceGamma()
+      let container = containerFor(source)
 
       stateLock.lock()
       clipGeneration += 1
@@ -328,20 +319,30 @@ import UIKit
         NSLog("MetalLayer: detached")
         return
       }
-      // Apply the container `resized` picked. This runs before the first
-      // drawable, so the layer is born with the right identity -- flipping it
-      // afterwards is what left the DV picture washed out in C4.8.
+      // Decide here rather than trusting `resized`: a clip that does not change
+      // the texture size never calls it, and this is the last moment where the
+      // container can be set safely -- before the layer owns a drawable.
+      // Flipping it afterwards is what left the DV picture washed out in C4.8.
+      let source = currentSourceGamma()
+      let container = containerFor(source)
       stateLock.lock()
-      let container = self.desiredContainer
+      let previous = self.container
       self.container = container
+      self.desiredContainer = container
+      if container != previous {
+        targetLanded = false
+        framesToSkip = 0
+        holdDeadline = CACurrentMediaTime() + 1.5
+      }
       stateLock.unlock()
+      if container != previous { applyVideoTarget(for: container) }
       configureLayer(container: container)
       // An attached layer with `isOpaque = true` and no drawable yet composites
       // as *white*, not black. Until the first real frame arrives that window is
       // the "white veil on the first frame" users report.
       paintBlack(layer: view.layer as? CAMetalLayer)
       NSLog(
-        "MetalLayer: attached \(view.bounds.size) container=\(container.rawValue) edrCapable=\(edrCapable ? 1 : 0)"
+        "MetalLayer: attached \(view.bounds.size) container=\(container.rawValue) source=\(source ?? "-") edrCapable=\(edrCapable ? 1 : 0)"
       )
     }
 
@@ -498,6 +499,26 @@ import UIKit
       NSLog(
         "MetalLayer: probe \(label) max=\(String(format: "%.3f", maximum)) mean=\(String(format: "%.3f", mean)) samples=\(count) layerEDR=\(layerIsEDR ? 1 : 0)"
       )
+    }
+
+    /// `video-params/gamma` -- the *source* transfer, which is what the container
+    /// choice is based on. Available as soon as the VO has a decoded frame.
+    private func currentSourceGamma() -> String? {
+      mpvHandle.flatMap {
+        MPVHelpers.getStringProperty($0, "video-params/gamma")
+      }
+    }
+
+    /// Which container a clip with this source transfer needs.
+    ///
+    /// Low Power Mode takes the EDR headroom away; claiming EDR then paints a
+    /// blown-out white picture, so those clips go to mpv's SDR tone mapper.
+    private func containerFor(_ source: String?) -> Container {
+      let wantsHDR =
+        source == "pq" || source == "hlg"
+        || source?.hasPrefix("dolbyvision") == true
+      guard wantsHDR, edrCapable else { return .sdr }
+      return ProcessInfo.processInfo.isLowPowerModeEnabled ? .sdr : .pq
     }
 
     /// The `target-trc` a container needs. Single source of truth for both the
