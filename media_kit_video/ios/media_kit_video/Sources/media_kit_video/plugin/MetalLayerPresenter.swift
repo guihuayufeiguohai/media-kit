@@ -28,8 +28,31 @@ import UIKit
     private let sourceFormat: MTLPixelFormat
     /// Linear Display-P3. Present only when EDR was requested *and*
     /// CoreGraphics knows the space -- permission to go HDR, not a decision.
-    private let linearColorspace: CGColorSpace?
+    private let hdrColorspace: CGColorSpace?
     private let srgbColorspace: CGColorSpace?
+    /// Which colour container mpv writes into and the layer is tagged with.
+    ///
+    /// Both are constant for the life of the sink, so neither brings back the
+    /// per-clip target race. They differ only in how iOS displays the result:
+    ///
+    /// | container | mpv target | iOS treatment | measured |
+    /// |---|---|---|---|
+    /// | `.pq` | `pq` / `bt.2020` | standard HDR video, absolute nits, system tone mapping | midtones match the earlier (approved) build |
+    /// | `.linearDisplayP3` | `linear` / `display-p3` | EDR layer, 1.0 = SDR white anchored at `peak / headroom` | visibly darker on device for the same clip |
+    ///
+    /// C4.14 chose the linear one for tidiness ("one container for SDR and HDR")
+    /// and it cost brightness: `probe max` showed the same absolute values
+    /// (DV P5 peaks at 3.93 = 393 nits, source `sig-peak` 493), yet the picture
+    /// read darker than the PQ build on the same frame. The values were never
+    /// wrong -- only the display mapping. PQ is what iOS is tuned for, so PQ is
+    /// the default again; the linear branch is kept for A/B in one rebuild.
+    private enum Container: String {
+      case pq
+      case linearDisplayP3
+    }
+
+    private static let container: Container = .pq
+
     /// True when EDR was requested *and* CoreGraphics has a PQ colorspace.
     private let edrCapable: Bool
     /// One pipeline per drawable format. The pipeline is chosen from the
@@ -130,27 +153,26 @@ import UIKit
         return nil
       }
 
-      // One linear-light container for everything.
+      // One container for every clip -- see `Container` for why it is PQ again.
       //
-      // mpv converts both SDR (bt.1886) and HDR (PQ/HLG) into linear light, so
-      // the layer is configured once, at attach, and never re-tagged. That
-      // removes the per-clip target change -- and with it the first-frame race
-      // that no amount of dropping or masking could fix.
-      //
-      // `extendedLinearDisplayP3` is the widest linear space CoreGraphics
-      // exposes on iOS (there is no linear BT.2020), which is also the right
-      // target: the panel is P3, so mpv does the 2020->P3 mapping in float
-      // instead of letting the compositor clip it.
-      var linearColorspace: CGColorSpace? = nil
+      // Constant per sink means the layer is configured once, at attach, and
+      // never re-tagged: that removes the per-clip target change, and with it
+      // the first-frame race that no amount of dropping or masking could fix.
+      var hdrColorspace: CGColorSpace? = nil
       if outputEDR {
-        linearColorspace = CGColorSpace(
-          name: CGColorSpace.extendedLinearDisplayP3
-        )
-        if linearColorspace == nil {
-          NSLog("MetalLayer: linear Display-P3 unavailable, staying SDR")
+        switch MetalLayerPresenter.container {
+        case .pq:
+          hdrColorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+        case .linearDisplayP3:
+          hdrColorspace = CGColorSpace(
+            name: CGColorSpace.extendedLinearDisplayP3
+          )
+        }
+        if hdrColorspace == nil {
+          NSLog("MetalLayer: \(MetalLayerPresenter.container) unavailable, staying SDR")
         }
       }
-      let edrCapable = linearColorspace != nil
+      let edrCapable = hdrColorspace != nil
 
       // Both pipelines up front: the drawable format follows the source and can
       // flip mid-playback (SDR clip -> HDR clip without a teardown), so
@@ -181,7 +203,7 @@ import UIKit
       self.pipeline8 = pipeline8
       self.pipeline16F = pipeline16F
       self.sourceFormat = pixelFormat16F ? .rgba16Float : .bgra8Unorm
-      self.linearColorspace = linearColorspace
+      self.hdrColorspace = hdrColorspace
       self.srgbColorspace = CGColorSpace(name: CGColorSpace.sRGB)
       self.edrCapable = edrCapable
       self.mpvHandle = mpvHandle
@@ -258,12 +280,12 @@ import UIKit
       )
     }
 
-    /// Configures the layer for linear-light EDR presentation.
+    /// Configures the layer for the chosen EDR container.
     ///
-    /// Same three values for every clip: `rgba16Float` + `extendedLinearDisplayP3`
-    /// + EDR. mpv has already converted the clip into linear light by the time
-    /// frames reach the ring, so there is nothing per-clip to decide and nothing
-    /// to change mid-playback.
+    /// Same three values for every clip: `rgba16Float` + the container's colour
+    /// space + EDR. mpv has already converted the clip into that container by the
+    /// time frames reach the ring, so there is nothing per-clip to decide and
+    /// nothing to change mid-playback.
     ///
     /// The transaction matters: `pixelFormat`, the EDR flag and the colorspace
     /// describe one display state and must be seen together. Set one at a time,
@@ -277,7 +299,7 @@ import UIKit
       stateLock.unlock()
       guard let layer = view?.layer as? CAMetalLayer else { return }
 
-      let wantsEDR = linearColorspace != nil
+      let wantsEDR = hdrColorspace != nil
       layerIsEDR = wantsEDR
       let format: MTLPixelFormat = wantsEDR ? .rgba16Float : .bgra8Unorm
 
@@ -291,7 +313,7 @@ import UIKit
           layer.wantsExtendedDynamicRangeContent = wantsEDR
         }
       }
-      layer.colorspace = wantsEDR ? linearColorspace : srgbColorspace
+      layer.colorspace = wantsEDR ? hdrColorspace : srgbColorspace
       CATransaction.commit()
 
       let cs = layer.colorspace.map { String(describing: $0.name) } ?? "nil"
@@ -408,26 +430,29 @@ import UIKit
       )
     }
 
-    /// Puts mpv into linear-light output, once.
+    /// Puts mpv into the chosen container's output, once, before any clip exists.
     ///
-    /// | option | value | why |
+    /// | container | `target-trc` | `target-prim` |
     /// |---|---|---|
-    /// | `target-trc` | `linear` | the one container both SDR and HDR can be converted into losslessly (16F) |
-    /// | `target-prim` | `display-p3` | matches the panel; CoreGraphics has no linear BT.2020, and 2020->P3 belongs in mpv's float pipeline rather than in the compositor's clip |
-    /// | `target-peak` | `100 x potential EDR headroom` | mpv's linear scale is "1.0 = diffuse white", so the panel's peak in that scale is exactly the headroom |
+    /// | `.pq` | `pq` | `bt.2020` |
+    /// | `.linearDisplayP3` | `linear` | `display-p3` |
     ///
-    /// `target-peak` is deliberately **not** a fixed 1000:
+    /// `target-peak` is `100 x potentialEDRHeadroom` in both cases -- deliberately
+    /// **not** a fixed 1000:
     ///
-    /// - in the old PQ passthrough it was a *second* tone mapper stacked on top
-    ///   of iOS's, which already maps to the real panel peak -- asking 1000 when
-    ///   the panel does 800 compresses twice, asking 1000 when it can do 1600
-    ///   throws highlights away;
-    /// - here it is the linear scale's ruler. Get it wrong and "1.0" no longer
-    ///   means the panel's diffuse white, which is exactly what any future
-    ///   RPU-driven tone mapping would compute its trims against.
+    /// - it is a *ceiling*: content at or below it is passed through untouched,
+    ///   anything above is rolled off by mpv. Asking 1000 when the panel does 800
+    ///   makes the compositor clip what mpv left alone; asking 1000 when the panel
+    ///   can do 1600 throws highlights away;
+    /// - measured proof that it is only a ceiling: this DV P5 title reports
+    ///   `sig-peak = 4.929` (493 nits) and the probe reads 3.93 at the peak frame.
+    ///   If 1.0 were the target peak, 493 nits could never exceed 0.616.
     ///
-    /// Once RPU handling lands, this is also the number the L2 trims are scaled
-    /// by, for the same reason.
+    /// So for a 493-nit title, 800 and 1000 are the same pixels -- `target-peak`
+    /// cannot be the reason the picture changed brightness between builds.
+    ///
+    /// Once RPU handling lands, `target-peak` is also the scale the L2 trims are
+    /// computed against, which is why it must track the real panel.
     ///
     /// Serialised on `targetQueue`, never main: `mpv_set_property` waits for the
     /// core's play loop, which can itself be waiting for the render thread. From
@@ -435,8 +460,19 @@ import UIKit
     /// C4.1 deadlock.
     private func applyVideoTarget() {
       guard let handle = mpvHandle else { return }
-      let trc = edrCapable ? "linear" : "auto"
-      let prim = edrCapable ? "display-p3" : "auto"
+      let trc: String
+      let prim: String
+      switch (edrCapable, MetalLayerPresenter.container) {
+      case (false, _):
+        trc = "auto"
+        prim = "auto"
+      case (true, .pq):
+        trc = "pq"
+        prim = "bt.2020"
+      case (true, .linearDisplayP3):
+        trc = "linear"
+        prim = "display-p3"
+      }
       let peak = edrCapable ? MetalLayerPresenter.linearPeak() : "auto"
       targetQueue.async { [weak self] in
         guard let self = self, !self.isClosed else { return }
@@ -454,9 +490,10 @@ import UIKit
       }
     }
 
-    /// The panel's peak expressed in mpv's linear scale, where 1.0 is diffuse
-    /// white: EDR headroom is by definition "how many times diffuse white the
-    /// display can go".
+    /// The panel's peak in nits, derived from the EDR headroom: headroom is by
+    /// definition "how many times diffuse white the display can go", so the peak
+    /// is `100 x headroom` on the assumption that diffuse white sits at 100 nits.
+    /// This only sets mpv's roll-off ceiling, not the display mapping.
     ///
     /// Read once, at attach. `currentEDRHeadroom` is still 1.00 there because the
     /// system ramps it once it sees EDR content, so `potential` is the honest
