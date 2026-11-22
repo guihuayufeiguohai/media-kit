@@ -296,15 +296,21 @@ import UIKit
       guard let layer = view?.layer as? CAMetalLayer else { return }
 
       let format: MTLPixelFormat = hdr ? .rgba16Float : .bgra8Unorm
+      // One transaction for all three: `pixelFormat`, the EDR flag and the
+      // colorspace describe a single display state, and the render server has
+      // to see them together. Assigning them one at a time leaves a window in
+      // which the layer is "16F but still SDR" -- and that is the state that
+      // sticks (washed-out DV that a rotation only fixes for the duration of
+      // the re-layout).
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
       // Assigning `pixelFormat` discards the drawables already handed out, so
       // only touch it when it actually differs.
       if layer.pixelFormat != format {
         layer.pixelFormat = format
       }
       // EDR *before* the colorspace: a layer that is still flagged as SDR can
-      // have an HDR colorspace clamped, and the layer then keeps looking SDR
-      // even though `colorspace` was assigned. Cheap to get right, invisible
-      // when it does not matter.
+      // have an HDR colorspace clamped.
       if #available(iOS 16.0, *) {
         if layer.wantsExtendedDynamicRangeContent != hdr {
           layer.wantsExtendedDynamicRangeContent = hdr
@@ -319,6 +325,7 @@ import UIKit
       } else {
         layer.colorspace = srgbColorspace
       }
+      CATransaction.commit()
       // Read back what the layer actually holds. The washed-out DV report was
       // "composited as SDR while tagged PQ", which is invisible from the code
       // path but obvious here -- a clamped colorspace or a dropped EDR flag.
