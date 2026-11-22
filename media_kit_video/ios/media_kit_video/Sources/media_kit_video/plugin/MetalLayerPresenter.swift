@@ -895,6 +895,91 @@ import UIKit
       }
     }
 
+    /// Gives up the EDR claim when the display has no headroom left.
+    ///
+    /// A PQ layer on a headroom-1.0 display paints the picture white -- that is
+    /// what Low Power Mode does to DV mid-playback, and mpv cannot compensate:
+    /// the damage happens in the compositor, after our pixels. The only exit is
+    /// the SDR container, which is the path SDR clips already use: bgra8 + sRGB
+    /// + EDR off, with mpv told to output `bt.1886`.
+    ///
+    /// `bt.1886` matters: `auto` means "keep the source", which for a PQ clip
+    /// leaves PQ in the ring -- and PQ read as sRGB is the white veil itself.
+    ///
+    /// One-way per clip. Coming back to EDR mid-playback is the transition that
+    /// leaves a layer stuck with its old identity (C4.8).
+    ///
+    /// Main thread (it touches the layer).
+    private func degradeToSDR() {
+      let isHDRSource = MetalLayerPresenter.isHDR(currentSourceGamma())
+      stateLock.lock()
+      guard !degraded, container == .pq else {
+        stateLock.unlock()
+        return
+      }
+      degraded = true
+      container = .sdr
+      desiredContainer = .sdr
+      targetLanded = false
+      framesToSkip = 0
+      holdDeadline = CACurrentMediaTime() + 1.5
+      stateLock.unlock()
+
+      NSLog(
+        "MetalLayer: EDR headroom gone -- dropping to the SDR container for this clip"
+      )
+      configureLayer(container: .sdr)
+      applyVideoTarget(for: .sdr, sourceIsHDR: isHDRSource)
+    }
+
+    /// Runs on Worker, before a frame is handed to the present queue. True when
+    /// this frame must not be shown.
+    ///
+    /// After a container change the ring still holds frames rendered for the old
+    /// target, and showing those with the new tag is the "blown out first frame"
+    /// (C4.12) or the white veil (SDR container, PQ content). The wait ends as
+    /// soon as mpv reports the expected target -- typically one or two frames --
+    /// and is bounded so a rejected write cannot leave a black screen.
+    private func frameMustWait() -> Bool {
+      stateLock.lock()
+      let kind = container
+      let landed = targetLanded
+      let skip = framesToSkip
+      let deadline = holdDeadline
+      stateLock.unlock()
+
+      if skip > 0 {
+        stateLock.lock()
+        framesToSkip = skip - 1
+        stateLock.unlock()
+        return true
+      }
+      if landed { return false }
+
+      guard let handle = mpvHandle else { return false }
+      stateLock.lock()
+      let want = wantedTrc
+      stateLock.unlock()
+      if MPVHelpers.getStringProperty(handle, "target-trc") == want {
+        stateLock.lock()
+        targetLanded = true
+        framesToSkip = 2
+        stateLock.unlock()
+        NSLog(
+          "MetalLayer: target \(want) landed -- waiting two frames for the ring to catch up"
+        )
+        return true
+      }
+      if CACurrentMediaTime() > deadline {
+        stateLock.lock()
+        targetLanded = true
+        stateLock.unlock()
+        NSLog("MetalLayer: target write never landed -- showing the frame anyway")
+        return false
+      }
+      return true
+    }
+
     /// Cheap precondition check so `VideoOutput` can pick the intermediate pixel
     /// format *before* building the renderer.
     ///
