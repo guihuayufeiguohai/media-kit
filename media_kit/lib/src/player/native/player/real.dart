@@ -2534,7 +2534,12 @@ class NativePlayer extends PlatformPlayer {
         'scale': 'bilinear',
         'dscale': 'bilinear',
         'cache': 'yes',
-        'cache-on-disk': 'yes',
+        // Disk cache needs `demuxer-cache-dir`, and nothing here sets one, so
+        // `yes` only ever produced `[e][lavf] Failed to create file cache.` on
+        // every open while caching nothing. The in-memory cache above is what
+        // actually buffers; keep disk caching off unless a cache directory is
+        // configured (and remember it writes gigabytes for a 4K remux).
+        'cache-on-disk': 'no',
         'hr-seek': 'yes',
         'hr-seek-framedrop': 'no',
         'correct-downscaling': 'no',
@@ -2580,7 +2585,10 @@ class NativePlayer extends PlatformPlayer {
           'target-peak': '135',
           'target-contrast': '1000',
           'tone-mapping': 'bt.2390',
-          'tone-mapping-mode': 'rgb',
+          // `tone-mapping-mode` is deliberately absent: mpv 0.41 (libplacebo
+          // 7.x) dropped it, so setting it is a silent no-op that only makes
+          // the config look like it does something. What used to be "rgb" is
+          // libplacebo's AUTO behaviour now.
           // The compositor's CAMetalLayer is kCGColorSpaceExtendedSRGB (probed
           // on an A15: colorspace "sRGB IEC61966-2.1; extended range",
           // pixelFormat 552 = MTLPixelFormatBGR10_XR). Leaving these on "auto"

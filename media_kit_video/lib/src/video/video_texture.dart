@@ -288,16 +288,19 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
       ].contains(state)) {
         if (widget.controller.player.state.playing) {
           _pauseDueToPauseUponEnteringBackgroundMode = true;
+          // Remember whether hardware decoding was in use *before* leaving: a
+          // clip that was already in software has nothing to recover.
+          _rememberHardwareDecoderState();
           widget.controller.player.pause();
         }
       } else {
         if (state == AppLifecycleState.resumed &&
             _pauseDueToPauseUponEnteringBackgroundMode) {
-          // iOS tore the VideoToolbox session down while we were backgrounded.
-          // Rebuild the decoder before the user resumes, otherwise mpv finds
-          // out on the first frame, gives up on hardware and spends the rest of
-          // the session in software.
-          _recoverHardwareDecoder();
+          // iOS may have torn the VideoToolbox session down while backgrounded,
+          // but that only becomes visible on the first decoded frame after
+          // coming back -- so start playing and watch, rather than rebuilding
+          // unconditionally (see `_watchHardwareDecoderAfterResume`).
+          _watchHardwareDecoderAfterResume();
         }
         if (widget.resumeUponEnteringForegroundMode &&
             _pauseDueToPauseUponEnteringBackgroundMode) {
@@ -310,6 +313,74 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
   }
 
   bool _recoveringHardwareDecoder = false;
+
+  /// Whether hardware decoding was really in use when the app went away.
+  ///
+  /// Only then is a rebuild worth anything: a clip that already plays in
+  /// software (AV1 on an A15, an unsupported profile) reports
+  /// `hwdec-current = no` the whole time, and toggling `hwdec` there would cost
+  /// two exact seeks on every resume for no gain.
+  bool _hwdecWasActive = false;
+
+  /// Watches `hwdec-current` for a few seconds after resume. See
+  /// `_watchHardwareDecoderAfterResume`.
+  Timer? _hwdecWatch;
+
+  Future<void> _rememberHardwareDecoderState() async {
+    if (!Platform.isIOS) return;
+    final platform = widget.controller.player.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      final current = await platform.getProperty('hwdec-current');
+      _hwdecWasActive = current.isNotEmpty && current != 'no';
+    } catch (_) {
+      _hwdecWasActive = false;
+    }
+  }
+
+  /// Rebuilds the decoder only if the VideoToolbox session really died.
+  ///
+  /// iOS invalidates the session while the app is in the background, and mpv
+  /// only finds out on the first frame it decodes afterwards
+  /// (`hevc: Failed to decode frame (invalid session, -12903)`). `hwdec-current`
+  /// still reports `videotoolbox` until that happens, so asking at `resumed`
+  /// answers nothing -- the verdict does not exist yet.
+  ///
+  /// So: let playback resume, then poll. A `no`/" " reading while the configured
+  /// `hwdec` is a hardware one means the fallback happened, and only then is the
+  /// two-step toggle worth its two exact seeks.
+  void _watchHardwareDecoderAfterResume() {
+    if (!Platform.isIOS || !_hwdecWasActive) return;
+    final platform = widget.controller.player.platform;
+    if (platform is! NativePlayer) return;
+    _hwdecWatch?.cancel();
+    var samples = 0;
+    _hwdecWatch = Timer.periodic(
+      const Duration(milliseconds: 300),
+      (timer) async {
+        samples += 1;
+        String current;
+        try {
+          current = await platform.getProperty('hwdec-current');
+        } catch (_) {
+          timer.cancel();
+          return;
+        }
+        if (current.isEmpty || current == 'no') {
+          timer.cancel();
+          debugPrint(
+            'media_kit: hardware decoding was lost while backgrounded '
+            '($current) -- rebuilding the decoder',
+          );
+          await _recoverHardwareDecoder();
+          return;
+        }
+        // 6s covers the first decoded frame of a 4K stream plus a slow seek. A
+        // session that survives that long is not going to fail on its own.
+        if (samples >= 20) timer.cancel();
+      },
+    );
+  }
 
   /// iOS invalidates the VideoToolbox session when the app goes to the
   /// background. mpv only finds out on the first decode after returning
@@ -405,6 +476,7 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _hwdecWatch?.cancel();
     _wakelock.disable();
     for (final subscription in _subscriptions) {
       subscription.cancel();
