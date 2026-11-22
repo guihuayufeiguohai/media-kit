@@ -286,11 +286,12 @@ class VideoState extends State<Video> with WidgetsBindingObserver {
         AppLifecycleState.paused,
         AppLifecycleState.detached,
       ].contains(state)) {
+        // Remember whether hardware decoding was in use *before* leaving: a
+        // clip that was already in software has nothing to recover, and this
+        // reading stays valid while paused (it describes the live decoder).
+        _rememberHardwareDecoderState();
         if (widget.controller.player.state.playing) {
           _pauseDueToPauseUponEnteringBackgroundMode = true;
-          // Remember whether hardware decoding was in use *before* leaving: a
-          // clip that was already in software has nothing to recover.
-          _rememberHardwareDecoderState();
           widget.controller.player.pause();
         }
       } else {
