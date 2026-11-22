@@ -65,6 +65,14 @@ import UIKit
     /// Hard stop for the hold, so a rejected property write cannot leave a black
     /// screen behind.
     private var holdDeadline: CFTimeInterval = 0
+    /// Presentation stays dropped until this time after a target write. Frames
+    /// rendered before mpv picks the new target are still in the ring, and they
+    /// must never reach the screen.
+    private var maskUntil: CFTimeInterval = 0
+    /// EDR headroom bookkeeping for the silent-drop fallback.
+    private var headroomEverHigh = false
+    private var headroomLowSamples = 0
+    private var headroomLost = false
 
     private let stateLock = NSLock()
     private weak var view: UIView?
@@ -222,6 +230,9 @@ import UIKit
       framesSinceResize = 0
       probePending = true
       steadyProbePending = true
+      headroomLost = false
+      headroomEverHigh = false
+      headroomLowSamples = 0
       DispatchQueue.main.sync {
         self.onResize(-1, size, .metalLayer)
       }
@@ -361,7 +372,9 @@ import UIKit
     /// SDR<->EDR transition can happen mid-playback; toggling LPM takes effect
     /// on the next clip.
     private var hdrAllowed: Bool {
-      edrCapable && !ProcessInfo.processInfo.isLowPowerModeEnabled
+      edrCapable
+        && !ProcessInfo.processInfo.isLowPowerModeEnabled
+        && !headroomLost
     }
 
     /// Fills the layer with black, once, right after attach.
@@ -500,6 +513,15 @@ import UIKit
         ok =
           MPVHelpers.setStringProperty(
             handle, "target-peak", hdr ? "1000" : "auto") && ok
+        if ok {
+          // mpv will re-render with the new target, but the ring already holds
+          // frames produced with the old one -- and those are tagged for the
+          // new one, which is the "first frame blown out" report. `holdFrames`
+          // cannot catch this: it only sees "the target has not changed yet",
+          // and by the time we look the write has already landed even though
+          // the frames predate it.
+          self.maskUntil = CACurrentMediaTime() + 0.25
+        }
         NSLog(
           "MetalLayer: mpv target -> trc=\(trc) prim=\(hdr ? "bt.2020" : "auto") peak=\(hdr ? "1000" : "auto")\(ok ? "" : " FAILED")"
         )
@@ -598,6 +620,11 @@ import UIKit
         // Something never converged; show the frame rather than a black screen.
         holdFrames = 0
         skipPresentFrames = 2
+      }
+
+      if CACurrentMediaTime() < maskUntil {
+        skippedStale += 1
+        return
       }
 
       if skipPresentFrames > 0 {
@@ -801,12 +828,32 @@ import UIKit
             "MetalLayer: edr headroom current=\(String(format: "%.2f", current)) potential=\(String(format: "%.2f", potential)) lpm=\(lpm ? 1 : 0)"
           )
           // iOS also drops EDR on its own (thermal / power budget) with Low
-          // Power Mode off; toggling it on and off restores it. Make that
-          // unmistakable in the log instead of another round of "looks flat".
-          if self.appliedHDR == true, current <= 1.02 {
-            NSLog(
-              "MetalLayer: EDR headroom lost mid-playback (current=\(String(format: "%.2f", current)) lpm=\(lpm ? 1 : 0)) -- the picture will look flat; this is a system power/thermal decision, not the render path"
-            )
+          // Power Mode off; toggling it on and off restores it. Track it and,
+          // after it has clearly gone away, fall back to mpv's SDR tone map for
+          // the rest of the clip -- a correct-looking SDR picture beats a flat
+          // PQ one.
+          //
+          // Hysteresis matters: at clip start the headroom ramps 1.00 -> 8.00
+          // over ~10s, so only act once it has been high and then stays at 1.00
+          // for two consecutive samples. One-way per clip: switching back to EDR
+          // mid-playback is the transition that has bitten us before.
+          if current > 1.5 {
+            self.headroomEverHigh = true
+            self.headroomLowSamples = 0
+          } else if self.headroomEverHigh, self.appliedHDR == true,
+            !self.headroomLost
+          {
+            self.headroomLowSamples += 1
+            if self.headroomLowSamples >= 2 {
+              self.headroomLost = true
+              NSLog(
+                "MetalLayer: EDR headroom gone for 10s (current=\(String(format: "%.2f", current)) lpm=\(lpm ? 1 : 0)) -- falling back to SDR tone mapping for this clip"
+              )
+            } else {
+              NSLog(
+                "MetalLayer: EDR headroom lost (current=\(String(format: "%.2f", current)) lpm=\(lpm ? 1 : 0)) -- waiting one more sample"
+              )
+            }
           }
         }
       }
