@@ -335,18 +335,14 @@ import UIKit
       let isHDRSource = MetalLayerPresenter.isHDR(source)
       let container = containerFor(source)
       stateLock.lock()
-      let previous = self.container
       self.container = container
       self.desiredContainer = container
-      if container != previous {
-        targetLanded = false
-        framesToSkip = 0
-        holdDeadline = CACurrentMediaTime() + 1.5
-      }
       stateLock.unlock()
-      if container != previous {
-        applyVideoTarget(for: container, sourceIsHDR: isHDRSource)
-      }
+      // Idempotent: it early-returns when mpv already agrees. Called
+      // unconditionally because the container can stay `.sdr` while the target
+      // still has to change (`auto` for an SDR clip, `bt.1886` for an HDR one
+      // that lost its EDR).
+      applyVideoTarget(for: container, sourceIsHDR: isHDRSource)
       configureLayer(container: container)
       // An attached layer with `isOpaque = true` and no drawable yet composites
       // as *white*, not black. Until the first real frame arrives that window is
@@ -589,8 +585,15 @@ import UIKit
     ) {
       guard let handle = mpvHandle else { return }
       let trc = MetalLayerPresenter.trc(for: container, sourceIsHDR: sourceIsHDR)
+      let current = MPVHelpers.getStringProperty(handle, "target-trc")
       stateLock.lock()
       wantedTrc = trc
+      if current != trc {
+        // Whatever is in the ring now was rendered for the old target.
+        targetLanded = false
+        framesToSkip = 0
+        holdDeadline = CACurrentMediaTime() + 1.5
+      }
       stateLock.unlock()
       let prim: String
       switch container {
