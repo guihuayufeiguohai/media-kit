@@ -251,13 +251,13 @@ import UIKit
       let source = mpvHandle.flatMap {
         MPVHelpers.getStringProperty($0, "video-params/gamma")
       }
-      let tag = MetalLayerPresenter.transferTag(source)
+      let tag = hdrAllowed ? MetalLayerPresenter.transferTag(source) : nil
       // The view is a fresh layer every time (route push/pop, Hero), so this
       // has to configure unconditionally rather than trust `appliedHDR`.
-      applyDrawable(gamma: tag, reason: "attach")
-      // Pre-arm mpv so the very first frames are already in `tag`, not SDR.
+      applyDrawable(gamma: tag, reason: "attach\(hdrAllowed ? "" : "/no-edr")")
+      // Pre-arm mpv so the very first frames already match `tag`.
       if let source = source {
-        applyMPVTarget(hdr: MetalLayerPresenter.isHDR(source))
+        applyMPVTarget(hdr: hdrAllowed && MetalLayerPresenter.isHDR(source))
       }
       // An attached layer with `isOpaque = true` and no drawable yet composites
       // as *white*, not black. Until the first real frame arrives (200-500ms on
@@ -344,6 +344,24 @@ import UIKit
 
     private static func isHDR(_ gamma: String?) -> Bool {
       gamma == "pq" || gamma == "hlg"
+    }
+
+    /// Whether HDR presentation is worth attempting at all.
+    ///
+    /// Low Power Mode pins `UIScreen.currentEDRHeadroom` to 1.0 -- confirmed on
+    /// device: same build, same clip, washed out with LPM on and correct with it
+    /// off. A PQ layer at headroom 1.0 has nowhere to put its highlights, so iOS
+    /// squeezes the whole range and the picture reads flat/grey to the eye while
+    /// a screenshot still looks right (the capture path uses the colorspace,
+    /// not the panel headroom).
+    ///
+    /// In that state mpv's own tone mapping to SDR (`target-trc=auto`) produces
+    /// a normal-looking SDR picture, which is strictly better than a washed-out
+    /// PQ one. Decided once per clip, before the layer owns a drawable, so no
+    /// SDR<->EDR transition can happen mid-playback; toggling LPM takes effect
+    /// on the next clip.
+    private var hdrAllowed: Bool {
+      edrCapable && !ProcessInfo.processInfo.isLowPowerModeEnabled
     }
 
     /// Fills the layer with black, once, right after attach.
@@ -523,7 +541,8 @@ import UIKit
           "video-out-params/gamma"
         )
       else { return }
-      let want = MetalLayerPresenter.transferTag(source)
+      // Same rule as `attach`: no EDR headroom -> no PQ, let mpv tone map to SDR.
+      let want = hdrAllowed ? MetalLayerPresenter.transferTag(source) : nil
       let now = MetalLayerPresenter.transferTag(
         MPVHelpers.getStringProperty(handle, "target-trc")
       )
@@ -776,7 +795,7 @@ import UIKit
           guard let self = self, !self.isClosed else { return }
           guard #available(iOS 16.0, *) else { return }
           NSLog(
-            "MetalLayer: edr headroom current=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom)) potential=\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom))"
+            "MetalLayer: edr headroom current=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom)) potential=\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom)) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0)"
           )
         }
       }
