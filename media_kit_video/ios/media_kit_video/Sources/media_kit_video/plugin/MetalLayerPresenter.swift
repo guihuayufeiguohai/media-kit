@@ -328,6 +328,12 @@ import UIKit
       )
     }
 
+    private var isClosed: Bool {
+      stateLock.lock()
+      defer { stateLock.unlock() }
+      return closed
+    }
+
     /// Samples a sparse grid of the frame mpv just produced and logs its range.
     /// One shot per clip; runs on `presentQueue`.
     ///
