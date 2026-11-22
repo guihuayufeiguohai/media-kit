@@ -864,14 +864,18 @@ import UIKit
     /// "render() not being called or stuck"，恢复后要等一次重建。
     @objc private func onBackground() {
       stateLock.lock()
+      let changed = !suspended
       suspended = true
       stateLock.unlock()
+      if changed { NSLog("MetalLayer: presenting suspended") }
     }
 
     @objc private func onForeground() {
       stateLock.lock()
+      let changed = suspended
       suspended = false
       stateLock.unlock()
+      if changed { NSLog("MetalLayer: presenting resumed") }
     }
 
     private func tick() {
