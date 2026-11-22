@@ -323,13 +323,15 @@ import UIKit
       // "composited as SDR while tagged PQ", which is invisible from the code
       // path but obvious here -- a clamped colorspace or a dropped EDR flag.
       let cs = layer.colorspace.map { String(describing: $0.name) } ?? "nil"
-      var headroom = ""
+      var edr = ""
       if #available(iOS 16.0, *) {
-        headroom =
-          " edrHeadroom=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom))/\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom))"
+        edr =
+          " wantsEDR=\(layer.wantsExtendedDynamicRangeContent ? 1 : 0)"
+          + " headroom=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom))"
+          + "/\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom))"
       }
       NSLog(
-        "MetalLayer: drawable \(hdr ? "rgba16f/\(gamma ?? "?") edr=1" : "bgra8/srgb edr=0") pf=\(layer.pixelFormat.rawValue) cs=\(cs) wantsEDR=\(layer.wantsExtendedDynamicRangeContent ? 1 : 0)\(headroom) (\(reason))"
+        "MetalLayer: drawable \(hdr ? "rgba16f/\(gamma ?? "?") edr=1" : "bgra8/srgb edr=0") pf=\(layer.pixelFormat.rawValue) cs=\(cs)\(edr) (\(reason))"
       )
     }
 
