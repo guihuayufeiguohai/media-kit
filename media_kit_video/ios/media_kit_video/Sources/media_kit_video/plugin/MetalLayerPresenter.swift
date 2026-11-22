@@ -28,8 +28,8 @@ import UIKit
     private let sourceFormat: MTLPixelFormat
     /// PQ. Built only when EDR was requested *and* CoreGraphics has it.
     private let hdrColorspace: CGColorSpace?
-    /// Linear Display-P3, used only to survive a headroom collapse. See
-    /// `degradeToLinear`.
+    /// Linear Display-P3. Kept for A/B against `.pq`; nothing selects it now
+    /// that a headroom collapse goes straight to `.sdr` (see `degradeToSDR`).
     private let linearColorspace: CGColorSpace?
     private let srgbColorspace: CGColorSpace?
     /// Which container mpv writes into and the layer is tagged with.
@@ -58,6 +58,9 @@ import UIKit
     /// `stateLock`; the present queue reads it through `container`.
     private var desiredContainer: Container = .sdr
     private var container: Container = .sdr
+    /// The `target-trc` the current container asked for. Read by
+    /// `frameMustWait` so it does not have to re-read `video-params` per frame.
+    private var wantedTrc = "auto"
     /// Set once mpv reports the target the container expects. Until then the
     /// ring still holds frames rendered for the old target and must not be
     /// shown (bounded by `holdDeadline`).
@@ -132,6 +135,10 @@ import UIKit
     private var maxDrawMs: Double = 0
     private var firstPresentLogged = false
     private var lastStats = CACurrentMediaTime()
+    /// Headroom is sampled every second while an EDR container is in use, but
+    /// logged every five so the log stays readable. Present queue only.
+    private var lastHeadroomCheck = CACurrentMediaTime()
+    private var lastHeadroomLog = CACurrentMediaTime()
 
     init?(
       renderer: ResizableTextureProtocol,
@@ -264,6 +271,7 @@ import UIKit
       // within a few ms) is the only window where changing the container is
       // safe, because the layer does not own a drawable yet.
       let source = currentSourceGamma()
+      let isHDRSource = MetalLayerPresenter.isHDR(source)
       let container = containerFor(source)
 
       stateLock.lock()
@@ -283,7 +291,7 @@ import UIKit
       // is nothing to wait for. After the first clip of a session it usually is
       // not: mpv keeps the previous target until this write lands, and until it
       // does the ring holds frames for the old one.
-      let want = MetalLayerPresenter.trc(for: applied)
+      let want = MetalLayerPresenter.trc(for: applied, sourceIsHDR: isHDRSource)
       let current = mpvHandle.flatMap {
         MPVHelpers.getStringProperty($0, "target-trc")
       }
@@ -292,7 +300,7 @@ import UIKit
       stateLock.unlock()
 
       if canApply {
-        applyVideoTarget(for: applied)
+        applyVideoTarget(for: applied, sourceIsHDR: isHDRSource)
       } else {
         NSLog(
           "MetalLayer: container change to \(container.rawValue) ignored (layer already composited as \(self.container.rawValue))"
@@ -324,6 +332,7 @@ import UIKit
       // container can be set safely -- before the layer owns a drawable.
       // Flipping it afterwards is what left the DV picture washed out in C4.8.
       let source = currentSourceGamma()
+      let isHDRSource = MetalLayerPresenter.isHDR(source)
       let container = containerFor(source)
       stateLock.lock()
       let previous = self.container
@@ -335,7 +344,9 @@ import UIKit
         holdDeadline = CACurrentMediaTime() + 1.5
       }
       stateLock.unlock()
-      if container != previous { applyVideoTarget(for: container) }
+      if container != previous {
+        applyVideoTarget(for: container, sourceIsHDR: isHDRSource)
+      }
       configureLayer(container: container)
       // An attached layer with `isOpaque = true` and no drawable yet composites
       // as *white*, not black. Until the first real frame arrives that window is
@@ -513,22 +524,34 @@ import UIKit
     ///
     /// Low Power Mode takes the EDR headroom away; claiming EDR then paints a
     /// blown-out white picture, so those clips go to mpv's SDR tone mapper.
-    private func containerFor(_ source: String?) -> Container {
-      let wantsHDR =
-        source == "pq" || source == "hlg"
+    static func isHDR(_ source: String?) -> Bool {
+      source == "pq" || source == "hlg"
         || source?.hasPrefix("dolbyvision") == true
-      guard wantsHDR, edrCapable else { return .sdr }
+    }
+
+    private func containerFor(_ source: String?) -> Container {
+      guard MetalLayerPresenter.isHDR(source), edrCapable else { return .sdr }
       return ProcessInfo.processInfo.isLowPowerModeEnabled ? .sdr : .pq
     }
 
     /// The `target-trc` a container needs. Single source of truth for both the
     /// write and the "has it landed" check.
-    private static func trc(for container: Container) -> String {
+    ///
+    /// The `.sdr` case depends on the *source*: `auto` means "keep the source
+    /// transfer", which is a no-op for SDR but leaves PQ untouched for an HDR
+    /// clip -- and PQ code values read as sRGB are exactly the "white veil" this
+    /// path exists to avoid. An HDR clip in the SDR container therefore asks for
+    /// `bt.1886` explicitly, which makes mpv do the tone map.
+    private static func trc(for container: Container, sourceIsHDR: Bool) -> String {
       switch container {
-      case .sdr: return "auto"
+      case .sdr: return sourceIsHDR ? "bt.1886" : "auto"
       case .pq: return "pq"
       case .linearEDR: return "linear"
       }
+    }
+
+    private func sourceIsHDR() -> Bool {
+      MetalLayerPresenter.isHDR(currentSourceGamma())
     }
 
     /// Puts mpv into the given container's output.
@@ -560,12 +583,18 @@ import UIKit
     /// core's play loop, which can itself be waiting for the render thread. From
     /// main that cycles with `resized()`'s `main.sync`; from Worker it is the
     /// C4.1 deadlock.
-    private func applyVideoTarget(for container: Container) {
+    private func applyVideoTarget(
+      for container: Container,
+      sourceIsHDR: Bool = false
+    ) {
       guard let handle = mpvHandle else { return }
-      let trc = MetalLayerPresenter.trc(for: container)
+      let trc = MetalLayerPresenter.trc(for: container, sourceIsHDR: sourceIsHDR)
+      stateLock.lock()
+      wantedTrc = trc
+      stateLock.unlock()
       let prim: String
       switch container {
-      case .sdr: prim = "auto"
+      case .sdr: prim = sourceIsHDR ? "bt.709" : "auto"
       case .pq: prim = "bt.2020"
       case .linearEDR: prim = "display-p3"
       }
@@ -817,113 +846,53 @@ import UIKit
           "MetalLayer: stats presented=\(presented) nil=\(skippedNil) busy=\(skippedBusy) noview=\(skippedNoView) hold=\(skippedHold) drawMax=\(Int(maxDrawMs))ms"
         )
         lastStats = now
-        // Sample the display's EDR headroom while playing, not just at attach.
-        DispatchQueue.main.async { [weak self] in
-          guard let self = self, !self.isClosed else { return }
-          guard #available(iOS 16.0, *) else { return }
-          let current = UIScreen.main.currentEDRHeadroom
-          let potential = UIScreen.main.potentialEDRHeadroom
-          let lpm = ProcessInfo.processInfo.isLowPowerModeEnabled
+      }
+
+      // Headroom decides whether an EDR layer is safe at all: Low Power Mode can
+      // take it away in one second, and every frame until we react is painted
+      // white. Check every second while an EDR container is in use; log every
+      // five so the file stays readable.
+      stateLock.lock()
+      let usesEDR = (container == .pq)
+      stateLock.unlock()
+      guard usesEDR, now - lastHeadroomCheck >= 1.0 else { return }
+      lastHeadroomCheck = now
+      let shouldLog = (now - lastHeadroomLog >= 5.0)
+      if shouldLog { lastHeadroomLog = now }
+
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, !self.isClosed else { return }
+        guard #available(iOS 16.0, *) else { return }
+        let current = UIScreen.main.currentEDRHeadroom
+        let lpm = ProcessInfo.processInfo.isLowPowerModeEnabled
+        if shouldLog {
           NSLog(
-            "MetalLayer: edr headroom current=\(String(format: "%.2f", current)) potential=\(String(format: "%.2f", potential)) lpm=\(lpm ? 1 : 0)"
+            "MetalLayer: edr headroom current=\(String(format: "%.2f", current)) potential=\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom)) lpm=\(lpm ? 1 : 0)"
           )
-
-          // A PQ layer on a display with no headroom paints a blown-out white
-          // picture -- that is what Low Power Mode did to DV mid-playback. The
-          // linear container only clips highlights there, so fall back to it.
-          //
-          // One-way per clip, and only after the headroom has been high once:
-          // at clip start it ramps 1.00 -> 8.00 over ~10s, and switching back to
-          // EDR mid-playback is the transition that leaves a layer stuck (C4.8).
-          guard self.container == .pq, !self.degraded else { return }
-          if current > 1.5 {
-            self.headroomEverHigh = true
-            self.headroomLowSamples = 0
-            return
-          }
-          guard self.headroomEverHigh else { return }
-          self.headroomLowSamples += 1
-          guard self.headroomLowSamples >= 2 else {
-            NSLog(
-              "MetalLayer: EDR headroom dropped to \(String(format: "%.2f", current)) lpm=\(lpm ? 1 : 0) -- one more sample before falling back"
-            )
-            return
-          }
-          self.degradeToLinear()
         }
-      }
-    }
+        guard self.container == .pq, !self.degraded else { return }
 
-    /// Stops claiming a PQ identity when the display has no headroom left.
-    ///
-    /// `colorspace` only -- the pixel format stays `rgba16Float`, so no drawable
-    /// is discarded and the compositor has the least possible to re-do. The
-    /// linear container renders the same nits with 1.0 as diffuse white, which
-    /// at headroom 1.0 merely clips highlights instead of blowing the picture out.
-    ///
-    /// Main thread (it touches the layer).
-    private func degradeToLinear() {
-      stateLock.lock()
-      degraded = true
-      container = .linearEDR
-      let view = self.view
-      stateLock.unlock()
-      NSLog(
-        "MetalLayer: EDR headroom gone -- switching to the linear container for this clip"
-      )
-      if let layer = view?.layer as? CAMetalLayer {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.colorspace = linearColorspace
-        CATransaction.commit()
+        // Low Power Mode is a deliberate user action: react on the first sample.
+        if lpm {
+          self.degradeToSDR()
+          return
+        }
+        // A thermal/power dip can recover; it needs to persist.
+        if current > 1.5 {
+          self.headroomEverHigh = true
+          self.headroomLowSamples = 0
+          return
+        }
+        guard self.headroomEverHigh else { return }
+        self.headroomLowSamples += 1
+        if self.headroomLowSamples < 3 {
+          NSLog(
+            "MetalLayer: EDR headroom at \(String(format: "%.2f", current)) -- waiting for it to settle"
+          )
+          return
+        }
+        self.degradeToSDR()
       }
-      applyVideoTarget(for: .linearEDR)
-    }
-
-    /// Runs on Worker, before a frame is handed to the present queue. True when
-    /// this frame must not be shown.
-    ///
-    /// The PQ container is born before mpv has switched its target, so the first
-    /// frames in the ring are still SDR-mapped. Showing those in a PQ layer is
-    /// the "blown out first frame" that C4.12 tried to mask for 250ms; here the
-    /// wait ends as soon as mpv reports the target, which is typically one or two
-    /// frames, and it is bounded so a rejected write cannot leave a black screen.
-    private func frameMustWait() -> Bool {
-      stateLock.lock()
-      let kind = container
-      let landed = targetLanded
-      let skip = framesToSkip
-      let deadline = holdDeadline
-      stateLock.unlock()
-
-      if skip > 0 {
-        stateLock.lock()
-        framesToSkip = skip - 1
-        stateLock.unlock()
-        return true
-      }
-      if landed { return false }
-
-      guard let handle = mpvHandle else { return false }
-      let want = MetalLayerPresenter.trc(for: kind)
-      if MPVHelpers.getStringProperty(handle, "target-trc") == want {
-        stateLock.lock()
-        targetLanded = true
-        framesToSkip = 2
-        stateLock.unlock()
-        NSLog(
-          "MetalLayer: target \(want) landed -- waiting two frames for the ring to catch up"
-        )
-        return true
-      }
-      if CACurrentMediaTime() > deadline {
-        stateLock.lock()
-        targetLanded = true
-        stateLock.unlock()
-        NSLog("MetalLayer: target write never landed -- showing the frame anyway")
-        return false
-      }
-      return true
     }
 
     /// Cheap precondition check so `VideoOutput` can pick the intermediate pixel
