@@ -283,10 +283,21 @@ import UIKit
       // the one already in use and say so.
       let canApply = (view == nil) || (container == self.container)
       if canApply { desiredContainer = container }
-      targetLanded = (container == .sdr)
       framesToSkip = 0
       holdDeadline = CACurrentMediaTime() + 1.5
       let applied = desiredContainer
+      stateLock.unlock()
+
+      // Already on the right target (SDR after SDR, HDR after HDR)? Then there
+      // is nothing to wait for. After the first clip of a session it usually is
+      // not: mpv keeps the previous target until this write lands, and until it
+      // does the ring holds frames for the old one.
+      let want = MetalLayerPresenter.trc(for: applied)
+      let current = mpvHandle.flatMap {
+        MPVHelpers.getStringProperty($0, "target-trc")
+      }
+      stateLock.lock()
+      targetLanded = (current == want)
       stateLock.unlock()
 
       if canApply {
@@ -489,6 +500,16 @@ import UIKit
       )
     }
 
+    /// The `target-trc` a container needs. Single source of truth for both the
+    /// write and the "has it landed" check.
+    private static func trc(for container: Container) -> String {
+      switch container {
+      case .sdr: return "auto"
+      case .pq: return "pq"
+      case .linearEDR: return "linear"
+      }
+    }
+
     /// Puts mpv into the given container's output.
     ///
     /// | container | `target-trc` | `target-prim` | why |
@@ -520,18 +541,12 @@ import UIKit
     /// C4.1 deadlock.
     private func applyVideoTarget(for container: Container) {
       guard let handle = mpvHandle else { return }
-      let trc: String
+      let trc = MetalLayerPresenter.trc(for: container)
       let prim: String
       switch container {
-      case .sdr:
-        trc = "auto"
-        prim = "auto"
-      case .pq:
-        trc = "pq"
-        prim = "bt.2020"
-      case .linearEDR:
-        trc = "linear"
-        prim = "display-p3"
+      case .sdr: prim = "auto"
+      case .pq: prim = "bt.2020"
+      case .linearEDR: prim = "display-p3"
       }
       let peak = (container == .sdr) ? "auto" : MetalLayerPresenter.linearPeak()
       targetQueue.async { [weak self] in
@@ -860,8 +875,6 @@ import UIKit
       let deadline = holdDeadline
       stateLock.unlock()
 
-      if kind == .sdr { return false }
-
       if skip > 0 {
         stateLock.lock()
         framesToSkip = skip - 1
@@ -871,13 +884,14 @@ import UIKit
       if landed { return false }
 
       guard let handle = mpvHandle else { return false }
-      if MPVHelpers.getStringProperty(handle, "target-trc") == "pq" {
+      let want = MetalLayerPresenter.trc(for: kind)
+      if MPVHelpers.getStringProperty(handle, "target-trc") == want {
         stateLock.lock()
         targetLanded = true
         framesToSkip = 2
         stateLock.unlock()
         NSLog(
-          "MetalLayer: target pq landed -- waiting two frames for the ring to catch up"
+          "MetalLayer: target \(want) landed -- waiting two frames for the ring to catch up"
         )
         return true
       }
