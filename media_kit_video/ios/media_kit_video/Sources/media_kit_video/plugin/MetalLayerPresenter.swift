@@ -767,6 +767,18 @@ import UIKit
           "MetalLayer: stats presented=\(presented) nil=\(skippedNil) busy=\(skippedBusy) noview=\(skippedNoView) stale=\(skippedStale) hold=\(skippedHold) drawMax=\(Int(maxDrawMs))ms"
         )
         lastStats = now
+        // Sample the display's EDR headroom while playing, not just at attach.
+        // A PQ layer with headroom 1.00 has nowhere to put its highlights and
+        // reads washed out to the eye while a screenshot still looks right --
+        // the "same build, fine yesterday, flat today" report. UIKit wants the
+        // main thread, and one block per 5s is free.
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self, !self.isClosed else { return }
+          guard #available(iOS 16.0, *) else { return }
+          NSLog(
+            "MetalLayer: edr headroom current=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom)) potential=\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom))"
+          )
+        }
       }
     }
 

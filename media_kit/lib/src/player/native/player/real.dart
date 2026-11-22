@@ -140,7 +140,7 @@ class NativePlayer extends PlatformPlayer {
   final Set<String> _audioRecoveryTried = <String>{};
 
   void _scheduleAudioRecovery() {
-    if (state.tracks.audio.isEmpty) return;
+    if (_realAudioTracks.isEmpty) return;
     // `track-list` can update more than once per load; keep the first schedule.
     if (_audioRecoveryTimer?.isActive ?? false) return;
     final generation = _mediaGeneration;
@@ -150,12 +150,22 @@ class NativePlayer extends PlatformPlayer {
     );
   }
 
+  /// Real audio tracks only.
+  ///
+  /// `Tracks()` defaults to `[auto, no]` -- mpv's *selection* pseudo-tracks, not
+  /// streams. A file with no audio at all still yields those two, and the first
+  /// version of this recovery happily "tried" them and finished by leaving
+  /// `aid=no`, which would mute a file whose audio simply had not started yet.
+  List<AudioTrack> get _realAudioTracks => state.tracks.audio
+      .where((t) => t.id != 'auto' && t.id != 'no')
+      .toList(growable: false);
+
   Future<void> _recoverAudio(int generation) async {
     bool audioUp() => state.audioParams.format?.isNotEmpty == true;
     if (disposed || generation != _mediaGeneration || audioUp()) return;
-    final audio = state.tracks.audio;
-    // Nothing to fall back to, and no point fighting a file that really has
-    // no usable audio.
+    final audio = _realAudioTracks;
+    // Nothing to fall back to: a single undecodable track has no alternative,
+    // and a file without audio must be left alone.
     if (audio.length < 2) return;
 
     for (final track in audio) {
