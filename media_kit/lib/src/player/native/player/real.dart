@@ -124,6 +124,57 @@ class NativePlayer extends PlatformPlayer {
     }
   }
 
+  // -- audio track recovery ------------------------------------------------
+  //
+  // mpv gives up on audio when the selected track's decoder is missing (a
+  // libavcodec built without `truehd`/`dca`, which is what the shipped bundle
+  // does) and simply reports "Audio: no audio" -- it does *not* try the other
+  // audio tracks, and there is no option to make it. A BluRay remux normally
+  // carries a Dolby TrueHD track (default) plus an AC3 compatibility track, so
+  // the file plays silently for no reason the user can see.
+  //
+  // So: after a file loads, if nothing is decoding audio and there is more than
+  // one audio track, try them in order until one produces output.
+  Timer? _audioRecoveryTimer;
+  int _mediaGeneration = 0;
+  final Set<String> _audioRecoveryTried = <String>{};
+
+  void _scheduleAudioRecovery() {
+    if (state.tracks.audio.isEmpty) return;
+    // `track-list` can update more than once per load; keep the first schedule.
+    if (_audioRecoveryTimer?.isActive ?? false) return;
+    final generation = _mediaGeneration;
+    _audioRecoveryTimer = Timer(
+      const Duration(milliseconds: 900),
+      () => _recoverAudio(generation),
+    );
+  }
+
+  Future<void> _recoverAudio(int generation) async {
+    bool audioUp() => state.audioParams.format?.isNotEmpty == true;
+    if (disposed || generation != _mediaGeneration || audioUp()) return;
+    final audio = state.tracks.audio;
+    // Nothing to fall back to, and no point fighting a file that really has
+    // no usable audio.
+    if (audio.length < 2) return;
+
+    for (final track in audio) {
+      if (disposed || generation != _mediaGeneration || audioUp()) return;
+      if (!_audioRecoveryTried.add(track.id)) continue;
+      print(
+        '[Player] no audio decoding, trying audio track ${track.id} '
+        '(${track.codec ?? "?"})',
+      );
+      try {
+        await setAudioTrack(track);
+      } catch (_) {}
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+    }
+    if (!audioUp() && !disposed && generation == _mediaGeneration) {
+      print('[Player] no audio track could be decoded for this media');
+    }
+  }
+
   /// Opens a [Media] or [Playlist] into the [Player].
   /// Passing [play] as `true` starts the playback immediately.
   ///
@@ -258,6 +309,11 @@ class NativePlayer extends PlatformPlayer {
       }
       await waitForPlayerInitialization;
       await waitForVideoControllerInitializationIfAttached;
+
+      // Any pending audio-track recovery belongs to the previous media.
+      _mediaGeneration++;
+      _audioRecoveryTimer?.cancel();
+      _audioRecoveryTried.clear();
 
       isShuffleEnabled = false;
       isPlayingStateChangeAllowed = false;
@@ -1990,6 +2046,7 @@ class NativePlayer extends PlatformPlayer {
           if (!tracksController.isClosed) {
             tracksController.add(state.tracks);
           }
+          _scheduleAudioRecovery();
         }
       }
       if (prop.ref.name.cast<Utf8>().toDartString() == 'sub-text' &&

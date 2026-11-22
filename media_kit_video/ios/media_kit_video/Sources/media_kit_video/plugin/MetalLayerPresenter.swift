@@ -245,6 +245,12 @@ import UIKit
       if let source = source {
         applyMPVTarget(hdr: MetalLayerPresenter.isHDR(source))
       }
+      // An attached layer with `isOpaque = true` and no drawable yet composites
+      // as *white*, not black. On an HDR clip the first real frame is 200-500ms
+      // away (mpv has to be told the target, then reconfigure), and that window
+      // is exactly the "white veil on the first frame" users report. Painting
+      // black costs one drawable and makes the wait invisible.
+      paintBlack(layer: view.layer as? CAMetalLayer)
       NSLog(
         "MetalLayer: attached \(view.bounds.size) tag=\(tag ?? "sdr") edrCapable=\(edrCapable ? 1 : 0) source=\(source ?? "-")"
       )
@@ -302,6 +308,42 @@ import UIKit
 
     private static func isHDR(_ gamma: String?) -> Bool {
       gamma == "pq" || gamma == "hlg"
+    }
+
+    /// Fills the layer with black, once, right after attach.
+    ///
+    /// Main thread. `allowsNextDrawableTimeout` keeps this from blocking when
+    /// the view is not on screen yet (it returns nil and we simply skip).
+    private func paintBlack(layer: CAMetalLayer?) {
+      guard let layer = layer else { return }
+      if layer.drawableSize.width < 1 || layer.drawableSize.height < 1 {
+        let scale = layer.contentsScale > 0 ? layer.contentsScale : 3
+        guard layer.bounds.width > 1, layer.bounds.height > 1 else { return }
+        layer.drawableSize = CGSize(
+          width: layer.bounds.width * scale,
+          height: layer.bounds.height * scale
+        )
+      }
+      guard let drawable = layer.nextDrawable(),
+        let commandBuffer = queue.makeCommandBuffer()
+      else { return }
+
+      let pass = MTLRenderPassDescriptor()
+      pass.colorAttachments[0].texture = drawable.texture
+      pass.colorAttachments[0].loadAction = .clear
+      pass.colorAttachments[0].storeAction = .store
+      // (0,0,0,1) is 0 nits in PQ just as it is in sRGB: black either way.
+      pass.colorAttachments[0].clearColor = MTLClearColor(
+        red: 0, green: 0, blue: 0, alpha: 1
+      )
+      guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass)
+      else { return }
+      encoder.endEncoding()
+      commandBuffer.present(drawable)
+      commandBuffer.commit()
+      NSLog(
+        "MetalLayer: painted black \(Int(drawable.texture.width))x\(Int(drawable.texture.height))"
+      )
     }
 
     /// Maps an mpv choice to a transfer we can tag, or nil for SDR.
