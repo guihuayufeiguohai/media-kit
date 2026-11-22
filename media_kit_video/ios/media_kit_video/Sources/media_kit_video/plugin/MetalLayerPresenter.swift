@@ -707,7 +707,7 @@ import UIKit
       if !firstPresentLogged {
         firstPresentLogged = true
         NSLog(
-          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(layerIsEDR ? "rgba16f/linear-p3" : "bgra8/srgb")"
+          "MetalLayer: first present src=\(sourceFormat == .rgba16Float ? "rgba16f" : "bgra8") dst=\(layerIsEDR ? "rgba16f/\(MetalLayerPresenter.container.rawValue)" : "bgra8/srgb")"
         )
       }
       let now = CACurrentMediaTime()
