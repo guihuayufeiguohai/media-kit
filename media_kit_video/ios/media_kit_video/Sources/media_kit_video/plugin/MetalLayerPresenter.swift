@@ -794,9 +794,20 @@ import UIKit
         DispatchQueue.main.async { [weak self] in
           guard let self = self, !self.isClosed else { return }
           guard #available(iOS 16.0, *) else { return }
+          let current = UIScreen.main.currentEDRHeadroom
+          let potential = UIScreen.main.potentialEDRHeadroom
+          let lpm = ProcessInfo.processInfo.isLowPowerModeEnabled
           NSLog(
-            "MetalLayer: edr headroom current=\(String(format: "%.2f", UIScreen.main.currentEDRHeadroom)) potential=\(String(format: "%.2f", UIScreen.main.potentialEDRHeadroom)) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0)"
+            "MetalLayer: edr headroom current=\(String(format: "%.2f", current)) potential=\(String(format: "%.2f", potential)) lpm=\(lpm ? 1 : 0)"
           )
+          // iOS also drops EDR on its own (thermal / power budget) with Low
+          // Power Mode off; toggling it on and off restores it. Make that
+          // unmistakable in the log instead of another round of "looks flat".
+          if self.appliedHDR == true, current <= 1.02 {
+            NSLog(
+              "MetalLayer: EDR headroom lost mid-playback (current=\(String(format: "%.2f", current)) lpm=\(lpm ? 1 : 0)) -- the picture will look flat; this is a system power/thermal decision, not the render path"
+            )
+          }
         }
       }
     }
