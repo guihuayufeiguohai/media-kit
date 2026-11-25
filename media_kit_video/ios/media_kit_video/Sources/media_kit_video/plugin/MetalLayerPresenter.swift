@@ -139,10 +139,14 @@ import UIKit
     /// logged every five so the log stays readable. Present queue only.
     private var lastHeadroomCheck = CACurrentMediaTime()
     private var lastHeadroomLog = CACurrentMediaTime()
-    /// Last `currentEDRHeadroom` seen while presenting. Main thread only.
-    /// Used to detect the 1.0 -> high transition, which is when a stale SDR
-    /// record on the layer can be nudged away.
-    private var lastHeadroomSeen: CGFloat = 0
+    /// Whether the EDR identity has already been re-declared for this clip.
+    ///
+    /// Deliberately a flag rather than a comparison against the previous
+    /// sample: headroom ramps through intermediate values (1.00 -> 1.2 -> 2.5
+    /// -> 4.8 -> 8.0), and a `previous <= 1.05` test gets stuck the moment one
+    /// sample lands in the 1.05..1.5 dead zone -- which is exactly what made
+    /// the first version of this never fire.
+    private var reassertedIdentity = false
 
     init?(
       renderer: ResizableTextureProtocol,
@@ -431,7 +435,7 @@ import UIKit
       layer.colorspace = colorspace
       CATransaction.commit()
 
-      lastHeadroomSeen = 0
+      reassertedIdentity = false
       let cs = layer.colorspace.map { String(describing: $0.name) } ?? "nil"
       var edr = ""
       if #available(iOS 16.0, *) {
@@ -928,10 +932,10 @@ import UIKit
         // makes the picture look right for a moment: the compositor is holding
         // a stale SDR record for this layer, and a re-assignment forces it to
         // re-evaluate. Invisible when the identity was already accepted.
-        if current > 1.5, self.lastHeadroomSeen <= 1.05 {
+        if current > 1.5, !self.reassertedIdentity {
+          self.reassertedIdentity = true
           self.reassertEDRIdentity()
         }
-        self.lastHeadroomSeen = current
 
         // Low Power Mode is a deliberate user action: react on the first sample.
         if lpm {
