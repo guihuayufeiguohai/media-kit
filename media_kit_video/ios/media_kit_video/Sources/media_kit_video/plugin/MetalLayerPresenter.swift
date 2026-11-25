@@ -81,6 +81,7 @@ import UIKit
     /// state, so a format change on the main thread cannot race a draw.
     private let pipeline8: MTLRenderPipelineState
     private let pipeline16F: MTLRenderPipelineState
+    private let pipeline10: MTLRenderPipelineState
     /// mpv handle, used once at attach to put mpv into linear output.
     private let mpvHandle: OpaquePointer?
     /// Whether the layer ended up presenting EDR content. Diagnostics only.
@@ -139,14 +140,6 @@ import UIKit
     /// logged every five so the log stays readable. Present queue only.
     private var lastHeadroomCheck = CACurrentMediaTime()
     private var lastHeadroomLog = CACurrentMediaTime()
-    /// Whether the EDR identity has already been re-declared for this clip.
-    ///
-    /// Deliberately a flag rather than a comparison against the previous
-    /// sample: headroom ramps through intermediate values (1.00 -> 1.2 -> 2.5
-    /// -> 4.8 -> 8.0), and a `previous <= 1.05` test gets stuck the moment one
-    /// sample lands in the 1.05..1.5 dead zone -- which is exactly what made
-    /// the first version of this never fire.
-    private var reassertedIdentity = false
 
     init?(
       renderer: ResizableTextureProtocol,
@@ -215,7 +208,8 @@ import UIKit
         return try? device.makeRenderPipelineState(descriptor: descriptor)
       }
       guard let pipeline8 = makePipeline(.bgra8Unorm),
-        let pipeline16F = makePipeline(.rgba16Float)
+        let pipeline16F = makePipeline(.rgba16Float),
+        let pipeline10 = makePipeline(.bgr10a2Unorm)
       else {
         NSLog("MetalLayer: makeRenderPipelineState failed")
         return nil
@@ -229,6 +223,7 @@ import UIKit
       self.sampler = sampler
       self.pipeline8 = pipeline8
       self.pipeline16F = pipeline16F
+      self.pipeline10 = pipeline10
       self.sourceFormat = pixelFormat16F ? .rgba16Float : .bgra8Unorm
       self.hdrColorspace = hdrColorspace
       self.linearColorspace = linearColorspace
@@ -414,7 +409,15 @@ import UIKit
 
       let wantsEDR = (container != .sdr)
       layerIsEDR = wantsEDR
-      let format: MTLPixelFormat = wantsEDR ? .rgba16Float : .bgra8Unorm
+      // PQ 必须配 10 位整数，不能配 16F：CA 把 16F 一律当线性 EDR，PQ 码值
+      // 会被当成"峰值百分比"摆到面板上，中间调整体抬高 = 泛白。Apple 的 PQ
+      // 示例用的就是 `.bgr10a2Unorm`；16F 只留给线性的 `linearEDR`。
+      let format: MTLPixelFormat
+      switch container {
+      case .sdr: format = .bgra8Unorm
+      case .pq: format = .bgr10a2Unorm
+      case .linearEDR: format = .rgba16Float
+      }
       let colorspace: CGColorSpace?
       switch container {
       case .sdr: colorspace = srgbColorspace
@@ -435,7 +438,6 @@ import UIKit
       layer.colorspace = colorspace
       CATransaction.commit()
 
-      reassertedIdentity = false
       let cs = layer.colorspace.map { String(describing: $0.name) } ?? "nil"
       var edr = ""
       if #available(iOS 16.0, *) {
@@ -789,6 +791,7 @@ import UIKit
       switch drawable.texture.pixelFormat {
       case .rgba16Float: pipeline = pipeline16F
       case .bgra8Unorm: pipeline = pipeline8
+      case .bgr10a2Unorm: pipeline = pipeline10
       default:
         inflight.signal()
         NSLog(
@@ -927,16 +930,6 @@ import UIKit
         }
         guard self.container == .pq, !self.degraded else { return }
 
-        // When the display finally grants headroom, re-declare the layer's EDR
-        // identity. This is the programmatic equivalent of the rotation that
-        // makes the picture look right for a moment: the compositor is holding
-        // a stale SDR record for this layer, and a re-assignment forces it to
-        // re-evaluate. Invisible when the identity was already accepted.
-        if current > 1.5, !self.reassertedIdentity {
-          self.reassertedIdentity = true
-          self.reassertEDRIdentity()
-        }
-
         // Low Power Mode is a deliberate user action: react on the first sample.
         if lpm {
           self.degradeToSDR()
@@ -958,36 +951,6 @@ import UIKit
         }
         self.degradeToSDR()
       }
-    }
-
-    /// Re-declares this layer's EDR identity to the compositor.
-    ///
-    /// The picture can be right during a rotation and washed out again once it
-    /// settles, which means the compositor is holding a stale (SDR) record for
-    /// this layer instead of the PQ one configured here. Rotation forces a
-    /// re-evaluation; this does the same in code. The EDR flag and the
-    /// colorspace are re-assigned inside one transaction so the layer never
-    /// exists in a half-applied state.
-    ///
-    /// Main thread.
-    private func reassertEDRIdentity() {
-      stateLock.lock()
-      let view = self.view
-      let container = self.container
-      stateLock.unlock()
-      guard container == .pq, let layer = view?.layer as? CAMetalLayer
-      else { return }
-
-      CATransaction.begin()
-      CATransaction.setDisableActions(true)
-      if #available(iOS 16.0, *) {
-        layer.wantsExtendedDynamicRangeContent = false
-        layer.wantsExtendedDynamicRangeContent = true
-      }
-      layer.colorspace = nil
-      layer.colorspace = hdrColorspace
-      CATransaction.commit()
-      NSLog("MetalLayer: re-asserted the EDR layer identity")
     }
 
     /// Gives up the EDR claim when the display has no headroom left.
