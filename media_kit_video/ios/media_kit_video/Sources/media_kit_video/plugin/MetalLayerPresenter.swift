@@ -139,6 +139,10 @@ import UIKit
     /// logged every five so the log stays readable. Present queue only.
     private var lastHeadroomCheck = CACurrentMediaTime()
     private var lastHeadroomLog = CACurrentMediaTime()
+    /// Last `currentEDRHeadroom` seen while presenting. Main thread only.
+    /// Used to detect the 1.0 -> high transition, which is when a stale SDR
+    /// record on the layer can be nudged away.
+    private var lastHeadroomSeen: CGFloat = 0
 
     init?(
       renderer: ResizableTextureProtocol,
@@ -427,6 +431,7 @@ import UIKit
       layer.colorspace = colorspace
       CATransaction.commit()
 
+      lastHeadroomSeen = 0
       let cs = layer.colorspace.map { String(describing: $0.name) } ?? "nil"
       var edr = ""
       if #available(iOS 16.0, *) {
@@ -918,6 +923,16 @@ import UIKit
         }
         guard self.container == .pq, !self.degraded else { return }
 
+        // When the display finally grants headroom, re-declare the layer's EDR
+        // identity. This is the programmatic equivalent of the rotation that
+        // makes the picture look right for a moment: the compositor is holding
+        // a stale SDR record for this layer, and a re-assignment forces it to
+        // re-evaluate. Invisible when the identity was already accepted.
+        if current > 1.5, self.lastHeadroomSeen <= 1.05 {
+          self.reassertEDRIdentity()
+        }
+        self.lastHeadroomSeen = current
+
         // Low Power Mode is a deliberate user action: react on the first sample.
         if lpm {
           self.degradeToSDR()
@@ -939,6 +954,36 @@ import UIKit
         }
         self.degradeToSDR()
       }
+    }
+
+    /// Re-declares this layer's EDR identity to the compositor.
+    ///
+    /// The picture can be right during a rotation and washed out again once it
+    /// settles, which means the compositor is holding a stale (SDR) record for
+    /// this layer instead of the PQ one configured here. Rotation forces a
+    /// re-evaluation; this does the same in code. The EDR flag and the
+    /// colorspace are re-assigned inside one transaction so the layer never
+    /// exists in a half-applied state.
+    ///
+    /// Main thread.
+    private func reassertEDRIdentity() {
+      stateLock.lock()
+      let view = self.view
+      let container = self.container
+      stateLock.unlock()
+      guard container == .pq, let layer = view?.layer as? CAMetalLayer
+      else { return }
+
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      if #available(iOS 16.0, *) {
+        layer.wantsExtendedDynamicRangeContent = false
+        layer.wantsExtendedDynamicRangeContent = true
+      }
+      layer.colorspace = nil
+      layer.colorspace = hdrColorspace
+      CATransaction.commit()
+      NSLog("MetalLayer: re-asserted the EDR layer identity")
     }
 
     /// Gives up the EDR claim when the display has no headroom left.
