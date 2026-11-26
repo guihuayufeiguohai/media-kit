@@ -7,8 +7,8 @@ all: Frameworks/*.xcframework Frameworks/.symlinks
 # Fribidi, Freetype, Png16, Mbedtls*, Dav1d, Xml2). Every dependency was
 # rewritten to @rpath/<Name>.framework/<Name>, so vendoring all of them is
 # what makes the app launch without dyld errors.
-MPV_BUNDLE_VERSION=v0.1.0-vulkan.14
-MPV_BUNDLE_SHA256SUM=8bda9c6bc6c227cd64d26ebe40e58e674ec4351fad2ea0ae43239b2e6fc1165e
+MPV_BUNDLE_VERSION=v0.1.0-vulkan.15
+MPV_BUNDLE_SHA256SUM=7b81db852f67d84c2f076034d9bedbf03a78587d269bf3abf1577c0e2aeeaab3
 MPV_BUNDLE_PATH=guihuayufeiguohai/libmpv-darwin-build-upgrade/releases/download/${MPV_BUNDLE_VERSION}/vulkan-bundle-ios-arm64.tar.gz
 
 # Direct github.com comes FIRST on purpose. Release assets are served by
