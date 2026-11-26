@@ -14,8 +14,8 @@ all: ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h
 # the same source and installs exactly the headers libmpv was compiled with.
 #
 # Bundle layout: ./include/mpv/{client,render,render_gl,render_vk,stream_cb}.h
-MPV_BUNDLE_VERSION=v0.1.0-vulkan.15
-MPV_BUNDLE_SHA256SUM=7b81db852f67d84c2f076034d9bedbf03a78587d269bf3abf1577c0e2aeeaab3
+MPV_BUNDLE_VERSION=v0.1.0-vulkan.16
+MPV_BUNDLE_SHA256SUM=c374a0cb863d14f8874e688c0ea77dc4a21d9c0f63c318995ce94d32fbc58150
 MPV_BUNDLE_PATH=guihuayufeiguohai/libmpv-darwin-build-upgrade/releases/download/${MPV_BUNDLE_VERSION}/vulkan-bundle-ios-arm64.tar.gz
 
 # Direct github.com comes FIRST on purpose. Release assets are served by
